@@ -1,0 +1,107 @@
+body, html, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+#animated-background {
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  width: 100vw;
+  z-index: -1;
+  background: linear-gradient(135deg, #0b0f2b, #10153f, #1a237e, #0d47a1);
+  background-size: 300% 300%;
+  animation: moveDiagonal 15s ease-in-out infinite;
+}
+
+@keyframes moveDiagonal {
+  0% {
+    background-position: 0% 100%;
+  }
+  50% {
+    background-position: 100% 0%;
+  }
+  100% {
+    background-position: 0% 100%;
+  }
+}
+
+
+/* Scrollbar Track */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+/* Scrollbar Track Background */
+::-webkit-scrollbar-track {
+  background: #0b0f2b; /* matches dark blue background */
+}
+
+/* Scrollbar Thumb */
+::-webkit-scrollbar-thumb {
+  background-color: #888; /* light grey thumb */
+  border-radius: 4px;
+  border: 1px solid #0b0f2b;
+}
+
+/* Scrollbar Thumb on Hover */
+::-webkit-scrollbar-thumb:hover {
+  background-color: #aaa;
+}
+
+::-webkit-scrollbar:horizontal {
+  height: 6px;
+}
+
+.App {
+  text-align: center;
+  max-width: 600px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+input[type="file"] {
+  margin: 20px 0;
+}
+
+button {
+  background-color: #007bff;
+  color: white;
+  padding: 10px 20px;
+  border: none;
+  cursor: pointer;
+}
+
+button:hover {
+  background-color: #0056b3;
+}
+
+a {
+  color: #007bff;
+  word-break: break-all;
+}
+
+#blob-corners {
+  position: fixed;
+  z-index: -1;
+  pointer-events: none;
+}
+
+.blob {
+  position: fixed;
+  width: 500px;
+  height: 500px;
+  opacity: 0.08;
+}
+
+.blob.top-left {
+  top: -150px;
+  left: -150px;
+}
+
+.blob.bottom-right {
+  bottom: -150px;
+  right: -150px;
+}
