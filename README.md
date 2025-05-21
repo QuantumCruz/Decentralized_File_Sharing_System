@@ -1,70 +1,53 @@
-# Getting Started with Create React App
+Decentralized File Sharing System
+A privacy-first, peer-to-peer file sharing desktop application that leverages Tor, IPFS, and WebSockets to securely distribute files with optional expiry, max download limits, and QR code access — all without any central server.
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+Features:
 
-## Available Scripts
+Tor Onion Services — Share files anonymously and securely over the Tor network.
 
-In the project directory, you can run:
+IPFS Integration — Store and retrieve files through the InterPlanetary File System.
 
-### `npm start`
+Max Downloads & Expiry — Limit access and auto-expire shared files.
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+WebSocket Upload Feedback — Live upload progress with persistent WebSocket status.
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+Electron Desktop App — Fully offline-capable .exe with no install required.
 
-### `npm test`
+Local-Only Execution — All processing and control remains on the user’s machine.
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+QR Code Generation — Instant sharing via QR for Onion links.
 
-### `npm run build`
+Folder Structure:
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+/frontend → React interface
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+/backend → Python aiohttp server
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+/resources/binaries → node.exe, Tor, IPFS, etc.
 
-### `npm run eject`
+Usage Instructions:
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+Clone this repository:
+git clone https://github.com/QuantumCruz/Decentralized_File_Sharing_System.git
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+Install dependencies:
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+Python: aiohttp, stem
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
+Node.js: used internally for webtorrent-hybrid
 
-## Learn More
+Run the desktop app:
 
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
+Use the prebuilt .exe or start with Electron for development
 
-To learn React, check out the [React documentation](https://reactjs.org/).
+Git Ignore Notes:
+This project excludes:
 
-### Code Splitting
+resources/binaries/ — external dependencies like node.exe, webtorrent-hybrid, Tor, etc.
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
+dist/ — packaged Electron output
 
-### Analyzing the Bundle Size
+.exe and .asar files — large build artifacts
 
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+License:
+MIT © 2025 QuantumCruz
