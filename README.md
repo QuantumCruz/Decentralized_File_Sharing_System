@@ -1,6 +1,5 @@
 # Decentralized File Sharing System  
 
-### Academic/Technical Summary  
 This project implements a **privacy-first, peer-to-peer file sharing system** that integrates **Tor Onion Services**, **IPFS (InterPlanetary File System)**, and **WebSockets** within a fully offline-capable **Electron desktop application**. The system was designed to address the challenges of centralized file sharing — surveillance risks, server costs, and single points of failure — by distributing responsibility entirely to user machines.  
 
 **Core Contributions:**  
