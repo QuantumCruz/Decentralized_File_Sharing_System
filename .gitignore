@@ -18,11 +18,12 @@ htmlcov/
 # Bundled binaries and build artifacts
 /binaries
 /build
-dist/
-*.exe
-*.asar
+/dist
+/dist-preview/
 /server/dist
 /server/build
+*.exe
+*.asar
 
 # Sensitive local application data
 /server/metadata.db

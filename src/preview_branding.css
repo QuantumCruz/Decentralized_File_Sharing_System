@@ -1,0 +1,10 @@
+/* The packaged application is branded by Electron.
+   Hide development-stage labels in the React dashboard. */
+
+.fs-dev-tag {
+  display: none !important;
+}
+
+.fs-footer {
+  display: none !important;
+}

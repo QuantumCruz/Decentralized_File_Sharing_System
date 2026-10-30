@@ -1,0 +1,45 @@
+{
+  "appId": "com.quantumcruz.fileshare.preview.rc",
+  "productName": "FileShare Preview",
+  "extraMetadata": {
+    "main": "public/preview_electron.js"
+  },
+  "files": [
+    "public/preview_electron.js",
+    "package.json"
+  ],
+  "asar": true,
+  "extraResources": [
+    {
+      "from": "dist-preview/backend",
+      "to": "backend",
+      "filter": [
+        "preview_server.exe"
+      ]
+    },
+    {
+      "from": "binaries",
+      "to": "binaries",
+      "filter": [
+        "ipfs.exe",
+        "tor.exe",
+        "cloudflared.exe",
+        "*.dll",
+        "geoip",
+        "geoip6"
+      ]
+    },
+    {
+      "from": "server/build",
+      "to": "server/build",
+      "filter": [
+        "**/*"
+      ]
+    }
+  ],
+  "directories": {
+    "output": "dist-preview",
+    "buildResources": "assets"
+  },
+  "win": {}
+}

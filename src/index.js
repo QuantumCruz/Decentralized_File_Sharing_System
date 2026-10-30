@@ -1,21 +1,26 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
-
 import {
   HashRouter,
-  Route,
-  Routes
+  Routes,
+  Route
 } from 'react-router-dom';
 
 import App from './App';
 import Download from './download';
+import './preview_branding.css';
 
+// Only explicit loopback OWNER ports render the management dashboard.
+// Public services use separate ports and never expose owner API routes.
+const ownerPorts = new Set([
+  '15300',
+  '25300'
+]);
 
-const isDevelopmentOwner = (
+const isOwner = (
   window.location.hostname === '127.0.0.1' &&
-  window.location.port === '15300'
+  ownerPorts.has(window.location.port)
 );
-
 
 function PublicLanding() {
   return (
@@ -24,28 +29,27 @@ function PublicLanding() {
         minHeight: '100vh',
         display: 'grid',
         placeItems: 'center',
+        padding: 24,
         background: '#0b0f2b',
         color: '#fff',
-        fontFamily: 'sans-serif'
+        fontFamily: 'Inter, Arial, sans-serif'
       }}
     >
       <section
         style={{
-          padding: 24,
-          textAlign: 'center'
+          textAlign: 'center',
+          maxWidth: 450
         }}
       >
-        <h1>Private FileShare</h1>
-
+        <h1>FileShare</h1>
         <p>
-          Open the secure link you received
-          to retrieve your file.
+          Use the private sharing link you received
+          to download a file.
         </p>
       </section>
     </main>
   );
 }
-
 
 ReactDOM.createRoot(
   document.getElementById('root')
@@ -55,12 +59,11 @@ ReactDOM.createRoot(
       <Route
         path="/"
         element={
-          isDevelopmentOwner
+          isOwner
             ? <App />
             : <PublicLanding />
         }
       />
-
       <Route
         path="/get/:shareId"
         element={<Download />}
