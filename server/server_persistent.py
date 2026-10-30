@@ -1,102 +1,72 @@
-import os
-import sys
-import secrets
-import json
+"""FileShare development backend.
+
+Provides an isolated owner API and public download API.
+Only the validated development runtime is supported.
+The installed FileShare application and its database are never opened.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import hmac
+import json
 import logging
-import zipfile
-import subprocess
-import requests
-import aiohttp
-from aiohttp import web, WSMsgType
-from stem.control import Controller
-from stem import SocketError
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import rsa, padding
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+import os
+import re
+import secrets
+import sqlite3
 import tempfile
 import time
+import zipfile
+
+from contextlib import closing
 from pathlib import Path
-import sqlite3
-import mimetypes
+from urllib.parse import quote
 
-# ========== BUILD DIR ==========
-if getattr(sys, 'frozen', False):
-    BUILD_DIR = os.path.normpath(
-        os.path.join(os.path.dirname(sys.executable), '..', 'server', 'build')
-    )
+import aiohttp
+
+from aiohttp import WSMsgType, web
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.ciphers import (
+    Cipher,
+    algorithms,
+    modes,
+)
+
+if __package__:
+    from .dev_runtime import load_development_runtime
 else:
-    BUILD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build')
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-IPFS_API = "http://127.0.0.1:5001/api/v0"
-
-# ========== IPFS ==========
-MAX_RETRIES = 30
-WAIT_SECONDS = 1
-
-for attempt in range(MAX_RETRIES):
-    try:
-        r = requests.post(f"{IPFS_API}/version", timeout=2)
-        r.raise_for_status()
-        print(f"Connected to IPFS: {r.json()}", flush=True)
-        break
-    except Exception as e:
-        print(f"IPFS not ready, retrying... ({attempt+1}/{MAX_RETRIES}): {e}", flush=True)
-        time.sleep(WAIT_SECONDS)
-else:
-    raise Exception("Failed to connect to IPFS after several retries")
+    from dev_runtime import load_development_runtime
 
 
-def ipfs_add_stream(file_path):
-    with open(file_path, "rb") as f:
-        response = requests.post(
-            f"{IPFS_API}/add",
-            files={"file": f},
-            stream=True
+LOG = logging.getLogger("fileshare")
+
+CHUNK = 64 * 1024
+TTL = 86400
+MAX_BYTES = 5 * 1024**3
+MAX_FILES = 100
+
+SHARE_ID = re.compile(
+    r"^[A-Za-z0-9_-]{16,128}$"
+)
+
+
+class Shares:
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+
+        self.db_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
-        response.raise_for_status()
-        last = None
-        for line in response.iter_lines():
-            if line:
-                last = json.loads(line)
-        return last["Hash"]
 
-
-def ipfs_pin_rm(ipfs_hash):
-    try:
-        requests.post(f"{IPFS_API}/pin/rm", params={"arg": ipfs_hash}, timeout=10)
-    except Exception as e:
-        logger.warning(f"Failed to unpin {ipfs_hash}: {e}")
-
-
-# ========== GLOBALS ==========
-tor_service = None
-service_id = None
-clearnet_url = None
-
-websocket_connections = {}
-download_progress = {}
-rate_limit_store = {}
-
-CHUNK_SIZE = 65536
-DEFAULT_TTL = 24 * 60 * 60
-
-DB_PATH = os.path.join(os.path.expanduser("~"), "AppData", "Local", "FileShare", "metadata.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-
-# ========== DATABASE ==========
-class ShareMetadata:
-    def __init__(self, db_path=DB_PATH):
-        self.db_path = db_path
-        self._init_db()
-
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db, db:
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS share_metadata (
                     share_id TEXT PRIMARY KEY,
                     ipfs_hash TEXT NOT NULL,
@@ -108,603 +78,1265 @@ class ShareMetadata:
                     active INTEGER NOT NULL DEFAULT 1,
                     expires_at REAL NOT NULL,
                     file_size INTEGER NOT NULL DEFAULT 0
-                );
+                )
             """)
-            conn.commit()
 
-    async def create_share(self, ipfs_hash, filename, content_type, private_key,
-                           file_size=0, max_downloads=1, expires_at=None, share_id=None):
-        share_id = share_id or secrets.token_urlsafe(16)
-        expires_at = expires_at or (time.time() + DEFAULT_TTL)
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
+    def create(
+        self,
+        share_id,
+        cid,
+        filename,
+        mime,
+        private_key,
+        size,
+        limit,
+    ):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db, db:
+            db.execute("""
                 INSERT INTO share_metadata
-                (share_id, ipfs_hash, filename, content_type, private_key, max_downloads, expires_at, file_size)
+                (
+                    share_id,
+                    ipfs_hash,
+                    filename,
+                    content_type,
+                    private_key,
+                    max_downloads,
+                    expires_at,
+                    file_size
+                )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (share_id, ipfs_hash, filename, content_type, private_key, max_downloads, expires_at, file_size))
-            conn.commit()
-        return share_id
+            """, (
+                share_id,
+                cid,
+                filename,
+                mime,
+                private_key,
+                limit,
+                time.time() + TTL,
+                size,
+            ))
 
-    async def check_download_limits(self, share_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                "SELECT active, download_count, max_downloads, expires_at FROM share_metadata WHERE share_id = ?",
-                (share_id,)
+    def get(self, share_id):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db:
+            cur = db.execute(
+                """
+                SELECT *
+                FROM share_metadata
+                WHERE share_id = ?
+                """,
+                (share_id,),
             )
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Invalid share ID")
-            active, count, max_dl, expires = row
-            if not active:
-                raise ValueError("Share link is inactive")
-            if count >= max_dl:
-                raise ValueError("Maximum downloads exceeded")
-            if time.time() > expires:
-                raise ValueError("Link has expired")
 
-    def get_metadata(self, share_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT * FROM share_metadata WHERE share_id = ?", (share_id,))
             row = cur.fetchone()
+
             if not row:
                 return None
-            return dict(zip([col[0] for col in cur.description], row))
 
-    def increment_download_count(self, share_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                "SELECT download_count, max_downloads FROM share_metadata WHERE share_id = ?",
-                (share_id,)
-            )
-            row = cur.fetchone()
-            if row:
-                count, max_dl = row
-                new_count = count + 1
-                active = 0 if new_count >= max_dl else 1
-                conn.execute(
-                    "UPDATE share_metadata SET download_count = ?, active = ? WHERE share_id = ?",
-                    (new_count, active, share_id)
+            return dict(
+                zip(
+                    (
+                        column[0]
+                        for column in cur.description
+                    ),
+                    row,
                 )
-                conn.commit()
-
-    def stop_share(self, share_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT ipfs_hash FROM share_metadata WHERE share_id = ?", (share_id,))
-            row = cur.fetchone()
-            if row:
-                conn.execute("UPDATE share_metadata SET active = 0 WHERE share_id = ?", (share_id,))
-                conn.commit()
-                return row[0]
-        return None
-
-    def get_all_expired(self):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                "SELECT share_id, ipfs_hash FROM share_metadata WHERE expires_at <= ?",
-                (time.time(),)
             )
-            return cur.fetchall()
 
-    def is_active(self, share_id):
-        with sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT active FROM share_metadata WHERE share_id = ?", (share_id,))
-            row = cur.fetchone()
-            return bool(row and row[0])
+    def active(self, share_id):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db:
+            return db.execute("""
+                SELECT 1
+                FROM share_metadata
+                WHERE share_id = ?
+                    AND active = 1
+                    AND expires_at > ?
+                    AND download_count < max_downloads
+            """, (
+                share_id,
+                time.time(),
+            )).fetchone() is not None
 
+    def consume(self, share_id):
+        # Atomically allocate one download.
+        # Interrupted downloads still consume an attempt.
+        # This avoids accidentally reactivating revoked shares.
 
-share_metadata = ShareMetadata()
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db, db:
+            cur = db.execute("""
+                UPDATE share_metadata
+                SET
+                    download_count = download_count + 1,
+                    active = CASE
+                        WHEN download_count + 1 >= max_downloads
+                        THEN 0
+                        ELSE 1
+                    END
+                WHERE share_id = ?
+                    AND active = 1
+                    AND expires_at > ?
+                    AND download_count < max_downloads
+            """, (
+                share_id,
+                time.time(),
+            ))
 
+            return cur.rowcount == 1
 
-# ========== TOR ==========
-def start_tor_service():
-    for _ in range(5):
-        try:
-            with Controller.from_port(port=9051) as controller:
-                controller.authenticate()
-                hidden_service = controller.create_ephemeral_hidden_service(
-                    ports={80: 5000}, await_publication=True, detached=True
+    def stop(self, share_id):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db, db:
+            row = db.execute(
+                """
+                SELECT ipfs_hash
+                FROM share_metadata
+                WHERE share_id = ?
+                """,
+                (share_id,),
+            ).fetchone()
+
+            if row:
+                db.execute(
+                    """
+                    UPDATE share_metadata
+                    SET active = 0
+                    WHERE share_id = ?
+                    """,
+                    (share_id,),
                 )
-                return hidden_service
-        except SocketError:
-            time.sleep(1)
-    raise RuntimeError("Failed to connect to Tor control port after multiple attempts")
+
+            return row[0] if row else None
+
+    def expired(self):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db:
+            return db.execute("""
+                SELECT share_id, ipfs_hash
+                FROM share_metadata
+                WHERE active = 1
+                    AND expires_at <= ?
+            """, (
+                time.time(),
+            )).fetchall()
+
+    def history(self):
+        with closing(
+            sqlite3.connect(self.db_path)
+        ) as db:
+            return db.execute("""
+                SELECT
+                    share_id,
+                    filename,
+                    max_downloads,
+                    download_count,
+                    active,
+                    expires_at
+                FROM share_metadata
+                ORDER BY expires_at DESC
+            """).fetchall()
 
 
-# ========== FRONTEND SERVING ==========
-async def serve_frontend(request):
-    index_path = os.path.join(BUILD_DIR, 'index.html')
-    if not os.path.exists(index_path):
-        return web.Response(text=f"Frontend not built. Looking in: {BUILD_DIR}", status=503)
-    return web.FileResponse(index_path)
-
-
-async def serve_static(request):
-    filename = request.match_info['filename']
-    file_path = os.path.join(BUILD_DIR, 'static', filename)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        mime, _ = mimetypes.guess_type(file_path)
-        return web.FileResponse(file_path, headers={"Content-Type": mime or "application/octet-stream"})
-    return web.Response(status=404)
-
-
-async def serve_root_file(request):
-    filename = request.match_info['filename']
-    file_path = os.path.join(BUILD_DIR, filename)
-    if os.path.exists(file_path) and os.path.isfile(file_path):
-        mime, _ = mimetypes.guess_type(file_path)
-        return web.FileResponse(file_path, headers={"Content-Type": mime or "application/octet-stream"})
-    return web.Response(status=404)
-
-
-# ========== CRYPTO HELPERS ==========
-def generate_key_pair():
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    return private_key, private_key.public_key()
-
-
-async def encrypt_file_to_temp_async(src_path, public_key, share_id):
-    aes_key = os.urandom(32)
-    nonce = os.urandom(12)
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce))
-    encryptor = cipher.encryptor()
-
-    encrypted_key = public_key.encrypt(
-        aes_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None,
-        ),
+def safe_filename(name):
+    cleaned = (
+        str(name or "")
+        .replace("\\", "/")
+        .split("/")[-1]
     )
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".enc")
-    tmp_path = tmp.name
-
-    tmp.write(encrypted_key)
-    tmp.write(b'\x00' * 16)
-    tmp.write(nonce)
-
-    total_size = os.path.getsize(src_path)
-    processed = 0
-    last_reported = -1
-
-    with open(src_path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            tmp.write(encryptor.update(chunk))
-            processed += len(chunk)
-            progress = 10 + int((processed / total_size) * 40)
-            if progress != last_reported:
-                last_reported = progress
-                if share_id in websocket_connections:
-                    for ws in websocket_connections[share_id]:
-                        try:
-                            await ws.send_str(json.dumps({"progress": progress, "status": "encrypting"}))
-                        except Exception:
-                            pass
-            await asyncio.sleep(0)
-
-    final_block = encryptor.finalize()
-    if final_block:
-        tmp.write(final_block)
-
-    tag = encryptor.tag
-    tmp.seek(256)
-    tmp.write(tag)
-    tmp.close()
-
-    file_size = os.path.getsize(tmp_path)
-    return tmp_path, file_size
-
-
-# ========== DOWNLOAD ==========
-async def download_file(request):
-    share_id = request.match_info["share_id"]
-    try:
-        await share_metadata.check_download_limits(share_id)
-        metadata = share_metadata.get_metadata(share_id)
-        if not metadata:
-            return web.json_response({"error": "Invalid or expired link"}, status=404)
-
-        private_key = serialization.load_pem_private_key(
-            metadata["private_key"].encode(), password=None
+    if (
+        not cleaned
+        or cleaned in (".", "..")
+        or any(ord(c) < 32 for c in cleaned)
+    ):
+        raise web.HTTPBadRequest(
+            text="Invalid filename"
         )
 
-        download_token = secrets.token_urlsafe(8)
-        stored_size = metadata.get("file_size", 0)
-        decrypted_size = stored_size - 284 if stored_size > 284 else 0
-
-        download_progress[download_token] = {
-            "bytes_sent": 0,
-            "total_bytes": decrypted_size,
-            "speed_mbps": 0.0,
-            "percent": 0,
-            "done": False,
-            "filename": metadata["filename"],
-        }
-
-        timeout = aiohttp.ClientTimeout(total=None, sock_connect=60, sock_read=None)
-
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                f"{IPFS_API}/cat",
-                params={"arg": metadata["ipfs_hash"]}
-            ) as ipfs_resp:
-                ipfs_resp.raise_for_status()
-
-                header = await ipfs_resp.content.readexactly(284)
-                encrypted_key = header[:256]
-                tag = header[256:272]
-                nonce = header[272:284]
-
-                aes_key = private_key.decrypt(
-                    encrypted_key,
-                    padding.OAEP(
-                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                        algorithm=hashes.SHA256(),
-                        label=None,
-                    ),
-                )
-
-                cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
-                decryptor = cipher.decryptor()
-
-                response = web.StreamResponse(
-                    status=200,
-                    headers={
-                        "Content-Type": metadata["content_type"],
-                        "Content-Disposition": f'attachment; filename="{metadata["filename"]}"',
-                        "Accept-Ranges": "bytes",
-                        "X-Download-Token": download_token,
-                        "Access-Control-Expose-Headers": "X-Download-Token",
-                        **({"Content-Length": str(decrypted_size)} if decrypted_size else {}),
-                    }
-                )
-                await response.prepare(request)
-
-                bytes_sent = 0
-                last_time = time.time()
-                last_bytes = 0
-
-                async for chunk in ipfs_resp.content.iter_chunked(CHUNK_SIZE):
-                    decrypted = decryptor.update(chunk)
-                    if decrypted:
-                        await response.write(decrypted)
-                        bytes_sent += len(decrypted)
-                        now = time.time()
-                        elapsed = now - last_time
-                        if elapsed >= 0.5:
-                            delta_bytes = bytes_sent - last_bytes
-                            speed_mbps = round((delta_bytes * 8) / elapsed / 1_000_000, 2)
-                            percent = int((bytes_sent / decrypted_size) * 100) if decrypted_size else 0
-                            download_progress[download_token].update({
-                                "bytes_sent": bytes_sent,
-                                "speed_mbps": speed_mbps,
-                                "percent": percent,
-                                "done": False,
-                            })
-                            last_time = now
-                            last_bytes = bytes_sent
-
-                final = decryptor.finalize()
-                if final:
-                    await response.write(final)
-                    bytes_sent += len(final)
-
-                download_progress[download_token].update({
-                    "bytes_sent": bytes_sent,
-                    "percent": 100,
-                    "speed_mbps": 0.0,
-                    "done": True,
-                })
-
-                await response.write_eof()
-                
-                share_metadata.increment_download_count(share_id)
-
-                async def cleanup_token():
-                    await asyncio.sleep(60)
-                    download_progress.pop(download_token, None)
-                asyncio.create_task(cleanup_token())
-
-                return response
-
-    except ValueError as e:
-        return web.json_response({"error": str(e)}, status=403)
-    except Exception as e:
-        logger.error(f"Download error: {e}", exc_info=True)
-        return web.json_response({"error": "Internal server error"}, status=500)
+    return cleaned
 
 
-async def get_download_progress(request):
-    token = request.match_info["token"]
-    data = download_progress.get(token)
-    if not data:
-        return web.json_response({"error": "Invalid or expired token"}, status=404)
-    return web.json_response(data)
+def resolve_asset(
+    root: Path,
+    name: str,
+) -> Path:
+    base = root.resolve()
+    target = (base / name).resolve()
+
+    if (
+        not target.is_relative_to(base)
+        or not target.is_file()
+    ):
+        raise web.HTTPNotFound()
+
+    return target
 
 
-# ========== UPLOAD ==========
-async def upload_file(request):
-    try:
-        reader = await request.multipart()
-        if not reader:
-            return web.json_response({"error": "No files uploaded"}, status=400)
+class FileShare:
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        temp_dir: Path,
+        build_dir: Path,
+        ipfs_api: str,
+        token: str,
+        tor_port: int,
+        clearnet_url: str | None = None,
+    ):
+        if len(token) < 32:
+            raise ValueError(
+                "Missing secure owner authentication secret"
+            )
 
-        max_downloads = int(request.query.get("max_downloads", 1))
-        if max_downloads < 1:
-            return web.json_response({"error": "Max downloads must be at least 1"}, status=400)
+        self.shares = Shares(db_path)
 
-        private_key, public_key = generate_key_pair()
-        share_id = request.query.get("share_id") or secrets.token_urlsafe(16)
+        self.temp_dir = Path(temp_dir)
+        self.temp_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
-        file_parts = []
-        async for part in reader:
-            if part.name != "files":
-                continue
-            filename = Path(part.filename).name
-            tmp = tempfile.NamedTemporaryFile(delete=False)
-            tmp_path = tmp.name
-            while True:
-                chunk = await part.read_chunk(CHUNK_SIZE)
-                if not chunk:
-                    break
-                tmp.write(chunk)
-            tmp.close()
-            file_parts.append({
+        self.build_dir = Path(build_dir)
+        self.ipfs_api = ipfs_api.rstrip("/")
+        self.token = token
+        self.tor_port = tor_port
+
+        self.onion = None
+        self.clearnet = clearnet_url
+
+        self.progress = {}
+        self.cleanup_task = None
+
+    def links(
+        self,
+        share_id,
+        filename,
+        limit,
+    ):
+        result = []
+
+        if self.onion:
+            result.append({
+                "share_id": share_id,
+                "share_link": (
+                    f"http://{self.onion}.onion"
+                    f"/#/get/{share_id}"
+                ),
                 "filename": filename,
-                "temp_path": tmp_path,
-                "content_type": part.headers.get("Content-Type", "application/octet-stream"),
+                "max_downloads": limit,
+                "link_type": "tor",
             })
 
-        if not file_parts:
-            return web.json_response({"error": "No valid files uploaded"}, status=400)
-
-        if len(file_parts) > 1:
-            zip_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-            zip_path = zip_tmp.name
-            zip_tmp.close()
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                for f in file_parts:
-                    zipf.write(f["temp_path"], arcname=f["filename"])
-            filename = request.query.get("zip_name", "bundle.zip")
-            if not filename.endswith(".zip"):
-                filename += ".zip"
-            content_type = "application/zip"
-            data_path = zip_path
-        else:
-            filename = file_parts[0]["filename"]
-            content_type = file_parts[0]["content_type"]
-            data_path = file_parts[0]["temp_path"]
-
-        async def send_progress(progress, status="uploading"):
-            if share_id in websocket_connections:
-                for ws in websocket_connections[share_id]:
-                    try:
-                        await ws.send_str(json.dumps({"progress": progress, "status": status}))
-                    except Exception:
-                        pass
-
-        await send_progress(10, "encrypting")
-
-        enc_path, enc_size = await encrypt_file_to_temp_async(data_path, public_key, share_id)
-
-        await send_progress(50, "uploading to IPFS")
-
-        async def ipfs_upload_with_progress():
-            loop = asyncio.get_event_loop()
-            task = loop.run_in_executor(None, ipfs_add_stream, enc_path)
-            p = 50
-            while not task.done():
-                await asyncio.sleep(1)
-                if p < 89:
-                    p += 1
-                    await send_progress(p, "uploading to IPFS")
-            return await task
-
-        ipfs_hash = await ipfs_upload_with_progress()
-
-        await send_progress(90, "finalizing")
-
-        await share_metadata.create_share(
-            ipfs_hash, filename, content_type,
-            private_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            ).decode(),
-            file_size=enc_size,
-            max_downloads=max_downloads,
-            share_id=share_id,
-        )
-
-        for f in file_parts:
-            os.remove(f["temp_path"])
-        if len(file_parts) > 1:
-            os.remove(zip_path)
-        os.remove(enc_path)
-
-        await send_progress(100, "complete")
-
-        if share_id in websocket_connections:
-            for ws in websocket_connections[share_id]:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-
-        links = [{
-            "share_id": share_id,
-            "share_link": f"http://{service_id}.onion/#/get/{share_id}",
-            "filename": filename,
-            "max_downloads": max_downloads,
-            "link_type": "tor",
-        }]
-        if clearnet_url:
-            links.append({
+        if self.clearnet:
+            result.append({
                 "share_id": share_id,
-                "share_link": f"{clearnet_url}/#/get/{share_id}",
+                "share_link": (
+                    f"{self.clearnet}"
+                    f"/#/get/{share_id}"
+                ),
                 "filename": filename,
-                "max_downloads": max_downloads,
+                "max_downloads": limit,
                 "link_type": "clearnet",
             })
 
-        return web.json_response({"share_links": links})
+        return result
 
-    except Exception as e:
-        logger.error(f"Upload error: {e}", exc_info=True)
-        return web.json_response({"error": "Internal server error"}, status=500)
+    async def broadcast(
+        self,
+        share_id,
+        progress,
+        status,
+    ):
+        sockets = list(
+            self.progress.get(
+                share_id,
+                [],
+            )
+        )
+
+        for socket in sockets:
+            try:
+                await socket.send_json({
+                    "progress": progress,
+                    "status": status,
+                })
+
+            except (
+                ConnectionError,
+                RuntimeError,
+            ):
+                LOG.debug(
+                    "Progress client disconnected"
+                )
+
+    async def ipfs_add(
+        self,
+        filename,
+    ):
+        timeout = aiohttp.ClientTimeout(
+            total=None,
+            sock_connect=30,
+        )
+
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+            with open(filename, "rb") as stream:
+                form = aiohttp.FormData()
+
+                form.add_field(
+                    "file",
+                    stream,
+                    filename="data.enc",
+                    content_type=(
+                        "application/octet-stream"
+                    ),
+                )
+
+                async with session.post(
+                    f"{self.ipfs_api}/add",
+                    data=form,
+                ) as response:
+                    response.raise_for_status()
+
+                    final = None
+
+                    async for line in response.content:
+                        if line.strip():
+                            final = json.loads(line)
+
+                    if (
+                        not final
+                        or not final.get("Hash")
+                    ):
+                        raise RuntimeError(
+                            "IPFS did not return a content hash"
+                        )
+
+                    return final["Hash"]
+
+    async def ipfs_unpin(self, cid):
+        try:
+            timeout = aiohttp.ClientTimeout(
+                total=20
+            )
+
+            async with aiohttp.ClientSession(
+                timeout=timeout
+            ) as session:
+                async with session.post(
+                    f"{self.ipfs_api}/pin/rm",
+                    params={
+                        "arg": cid,
+                    },
+                ) as response:
+                    response.raise_for_status()
+
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ):
+            LOG.warning(
+                "Unable to unpin IPFS object: %s",
+                cid,
+            )
+
+    async def upload(self, request):
+        temporary = []
+
+        try:
+            try:
+                limit = int(
+                    request.query.get(
+                        "max_downloads",
+                        "1",
+                    )
+                )
+
+            except ValueError:
+                raise web.HTTPBadRequest(
+                    text=(
+                        "Maximum downloads "
+                        "must be an integer"
+                    )
+                )
+
+            if not 1 <= limit <= 100000:
+                raise web.HTTPBadRequest(
+                    text="Maximum downloads out of range"
+                )
+
+            share_id = (
+                request.query.get("share_id")
+                or secrets.token_urlsafe(24)
+            )
+
+            if not SHARE_ID.fullmatch(share_id):
+                raise web.HTTPBadRequest(
+                    text="Invalid share identifier"
+                )
+
+            if self.shares.get(share_id):
+                raise web.HTTPConflict(
+                    text="This share identifier already exists"
+                )
+
+            reader = await request.multipart()
+
+            uploaded = []
+            total = 0
+
+            while part := await reader.next():
+                if part.name != "files":
+                    continue
+
+                if len(uploaded) >= MAX_FILES:
+                    raise web.HTTPRequestEntityTooLarge(
+                        max_size=MAX_FILES,
+                        actual_size=len(uploaded) + 1,
+                    )
+
+                name = safe_filename(
+                    part.filename
+                )
+
+                temp = tempfile.NamedTemporaryFile(
+                    dir=self.temp_dir,
+                    delete=False,
+                )
+
+                temporary.append(
+                    Path(temp.name)
+                )
+
+                with temp:
+                    while chunk := await part.read_chunk(
+                        CHUNK
+                    ):
+                        total += len(chunk)
+
+                        if total > MAX_BYTES:
+                            raise web.HTTPRequestEntityTooLarge(
+                                max_size=MAX_BYTES,
+                                actual_size=total,
+                            )
+
+                        temp.write(chunk)
+
+                uploaded.append((
+                    name,
+                    Path(temp.name),
+                    part.headers.get(
+                        "Content-Type",
+                        "application/octet-stream",
+                    ),
+                ))
+
+            if not uploaded:
+                raise web.HTTPBadRequest(
+                    text="No files were selected"
+                )
+
+            if len(uploaded) > 1:
+                filename = safe_filename(
+                    request.query.get(
+                        "zip_name",
+                        "bundle.zip",
+                    )
+                )
+
+                if not filename.lower().endswith(
+                    ".zip"
+                ):
+                    filename += ".zip"
+
+                names = {
+                    item[0]
+                    for item in uploaded
+                }
+
+                if len(names) != len(uploaded):
+                    raise web.HTTPBadRequest(
+                        text=(
+                            "The selected files "
+                            "include duplicate names"
+                        )
+                    )
+
+                zip_temp = tempfile.NamedTemporaryFile(
+                    dir=self.temp_dir,
+                    delete=False,
+                    suffix=".zip",
+                )
+
+                zipped = Path(zip_temp.name)
+                temporary.append(zipped)
+                zip_temp.close()
+
+                with zipfile.ZipFile(
+                    zipped,
+                    "w",
+                    compression=zipfile.ZIP_DEFLATED,
+                ) as archive:
+                    for name, file_path, _ in uploaded:
+                        archive.write(
+                            file_path,
+                            arcname=name,
+                        )
+
+                source = zipped
+                mime = "application/zip"
+
+            else:
+                filename, source, mime = uploaded[0]
+
+            key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+
+            aes_key = secrets.token_bytes(32)
+            nonce = secrets.token_bytes(12)
+
+            wrapped = key.public_key().encrypt(
+                aes_key,
+                padding.OAEP(
+                    mgf=padding.MGF1(
+                        hashes.SHA256()
+                    ),
+                    algorithm=hashes.SHA256(),
+                    label=None,
+                ),
+            )
+
+            encryptor = Cipher(
+                algorithms.AES(aes_key),
+                modes.GCM(nonce),
+            ).encryptor()
+
+            enc_temp = tempfile.NamedTemporaryFile(
+                dir=self.temp_dir,
+                delete=False,
+                suffix=".enc",
+            )
+
+            encrypted = Path(enc_temp.name)
+            temporary.append(encrypted)
+
+            with enc_temp as destination, open(
+                source,
+                "rb",
+            ) as origin:
+                destination.write(wrapped)
+                destination.write(b"\0" * 16)
+                destination.write(nonce)
+
+                processed = 0
+                size = source.stat().st_size
+                last_percent = -1
+
+                while chunk := origin.read(CHUNK):
+                    destination.write(
+                        encryptor.update(chunk)
+                    )
+
+                    processed += len(chunk)
+
+                    percent = (
+                        10 + int(
+                            processed * 40 / size
+                        )
+                        if size
+                        else 50
+                    )
+
+                    if percent != last_percent:
+                        last_percent = percent
+
+                        await self.broadcast(
+                            share_id,
+                            percent,
+                            "encrypting",
+                        )
+
+                    await asyncio.sleep(0)
+
+                destination.write(
+                    encryptor.finalize()
+                )
+
+                destination.seek(256)
+                destination.write(encryptor.tag)
+
+            await self.broadcast(
+                share_id,
+                50,
+                "uploading to IPFS",
+            )
+
+            cid = await self.ipfs_add(
+                encrypted
+            )
+
+            await self.broadcast(
+                share_id,
+                90,
+                "finalizing",
+            )
+
+            pem = key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ).decode()
+
+            try:
+                self.shares.create(
+                    share_id,
+                    cid,
+                    filename,
+                    mime,
+                    pem,
+                    encrypted.stat().st_size,
+                    limit,
+                )
+
+            except Exception:
+                await self.ipfs_unpin(cid)
+                raise
+
+            await self.broadcast(
+                share_id,
+                100,
+                "complete",
+            )
+
+            return web.json_response({
+                "share_links": self.links(
+                    share_id,
+                    filename,
+                    limit,
+                ),
+            })
+
+        finally:
+            for file_path in temporary:
+                try:
+                    file_path.unlink(
+                        missing_ok=True
+                    )
+
+                except OSError:
+                    LOG.warning(
+                        "Unable to clean temporary upload: %s",
+                        file_path,
+                    )
+
+    async def download(self, request):
+        share_id = request.match_info[
+            "share_id"
+        ]
+
+        metadata = self.shares.get(
+            share_id
+        )
+
+        if (
+            not metadata
+            or not self.shares.active(share_id)
+        ):
+            raise web.HTTPNotFound(
+                text=(
+                    "This link is unavailable "
+                    "or expired"
+                )
+            )
+
+        temp_path = None
+
+        try:
+            private_key = (
+                serialization.load_pem_private_key(
+                    metadata["private_key"].encode(),
+                    password=None,
+                )
+            )
+
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=60,
+            )
+
+            async with aiohttp.ClientSession(
+                timeout=timeout
+            ) as session:
+                async with session.post(
+                    f"{self.ipfs_api}/cat",
+                    params={
+                        "arg": metadata["ipfs_hash"],
+                    },
+                ) as response:
+                    response.raise_for_status()
+
+                    header = await (
+                        response.content.readexactly(
+                            284
+                        )
+                    )
+
+                    aes_key = private_key.decrypt(
+                        header[:256],
+                        padding.OAEP(
+                            mgf=padding.MGF1(
+                                hashes.SHA256()
+                            ),
+                            algorithm=hashes.SHA256(),
+                            label=None,
+                        ),
+                    )
+
+                    decryptor = Cipher(
+                        algorithms.AES(aes_key),
+                        modes.GCM(
+                            header[272:284],
+                            header[256:272],
+                        ),
+                    ).decryptor()
+
+                    out = tempfile.NamedTemporaryFile(
+                        dir=self.temp_dir,
+                        delete=False,
+                    )
+
+                    temp_path = Path(
+                        out.name
+                    )
+
+                    with out:
+                        async for chunk in (
+                            response.content.iter_chunked(
+                                CHUNK
+                            )
+                        ):
+                            out.write(
+                                decryptor.update(
+                                    chunk
+                                )
+                            )
+
+                        # Verify the entire encrypted object
+                        # before sending any plaintext.
+                        out.write(
+                            decryptor.finalize()
+                        )
+
+            # Allocate one download atomically.
+            # Disconnected transfers consume an attempt.
+            if not self.shares.consume(
+                share_id
+            ):
+                raise web.HTTPForbidden(
+                    text=(
+                        "The download limit "
+                        "has been reached"
+                    )
+                )
+
+            filename = safe_filename(
+                metadata["filename"]
+            ).replace('"', "_")
+
+            output = web.StreamResponse(
+                status=200,
+                headers={
+                    "Content-Type": (
+                        metadata["content_type"]
+                    ),
+                    "Content-Disposition": (
+                        "attachment; "
+                        "filename*=UTF-8''"
+                        + quote(filename)
+                    ),
+                    "Content-Length": str(
+                        temp_path.stat().st_size
+                    ),
+                    "Cache-Control": "no-store",
+                },
+            )
+
+            await output.prepare(
+                request
+            )
+
+            with open(temp_path, "rb") as source:
+                while chunk := source.read(CHUNK):
+                    await output.write(
+                        chunk
+                    )
+
+            await output.write_eof()
+
+            return output
+
+        except web.HTTPException:
+            raise
+
+        except (
+            aiohttp.ClientError,
+            ValueError,
+            OSError,
+            asyncio.IncompleteReadError,
+            InvalidTag,
+        ):
+            LOG.exception(
+                "Download failed"
+            )
+
+            raise web.HTTPBadGateway(
+                text="Unable to retrieve the file"
+            )
+
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(
+                        missing_ok=True
+                    )
+
+                except OSError:
+                    LOG.warning(
+                        "Unable to remove verified download: %s",
+                        temp_path,
+                    )
+
+    async def stop(self, request):
+        share_id = request.match_info[
+            "share_id"
+        ]
+
+        cid = self.shares.stop(
+            share_id
+        )
+
+        if not cid:
+            raise web.HTTPNotFound()
+
+        await self.ipfs_unpin(cid)
+
+        return web.json_response({
+            "status": "stopped",
+            "share_id": share_id,
+        })
+
+    async def history(self, request):
+        results = []
+
+        for (
+            share_id,
+            filename,
+            limit,
+            count,
+            active,
+            expires,
+        ) in self.shares.history():
+
+            row = {
+                "share_id": share_id,
+                "filename": filename,
+                "max_downloads": limit,
+                "download_count": count,
+                "active": bool(
+                    active
+                    and expires > time.time()
+                    and count < limit
+                ),
+                "expires_at": expires,
+                "tor_link": None,
+                "clearnet_link": None,
+            }
+
+            for link in self.links(
+                share_id,
+                filename,
+                limit,
+            ):
+                field = (
+                    "tor_link"
+                    if link["link_type"] == "tor"
+                    else "clearnet_link"
+                )
+
+                row[field] = link[
+                    "share_link"
+                ]
+
+            results.append(row)
+
+        return web.json_response(
+            results
+        )
+
+    async def status(self, request):
+        share_id = request.match_info[
+            "share_id"
+        ]
+
+        return web.json_response({
+            "active": self.shares.active(
+                share_id
+            ),
+        })
+
+    async def websocket(self, request):
+        share_id = request.match_info[
+            "share_id"
+        ]
+
+        if not SHARE_ID.fullmatch(
+            share_id
+        ):
+            raise web.HTTPBadRequest(
+                text="Invalid share identifier"
+            )
+
+        ws = web.WebSocketResponse()
+
+        await ws.prepare(
+            request
+        )
+
+        self.progress.setdefault(
+            share_id,
+            [],
+        ).append(ws)
+
+        try:
+            async for msg in ws:
+                if (
+                    msg.type == WSMsgType.TEXT
+                    and msg.data == "close"
+                ):
+                    break
+
+        finally:
+            entries = self.progress.get(
+                share_id,
+                [],
+            )
+
+            if ws in entries:
+                entries.remove(ws)
+
+            if not entries:
+                self.progress.pop(
+                    share_id,
+                    None,
+                )
+
+        return ws
+
+    async def frontend(self, request):
+        target = (
+            self.build_dir / "index.html"
+        )
+
+        if not target.is_file():
+            raise web.HTTPServiceUnavailable(
+                text=(
+                    "Frontend has not been built"
+                )
+            )
+
+        return web.FileResponse(
+            target
+        )
+
+    async def static(self, request):
+        target = resolve_asset(
+            self.build_dir / "static",
+            request.match_info["filename"],
+        )
+
+        return web.FileResponse(
+            target
+        )
+
+    async def root_asset(self, request):
+        target = resolve_asset(
+            self.build_dir,
+            request.match_info["filename"],
+        )
+
+        return web.FileResponse(
+            target
+        )
+
+    async def cleanup_expired(self):
+        while True:
+            await asyncio.sleep(
+                3600
+            )
+
+            for (
+                share_id,
+                cid,
+            ) in self.shares.expired():
+                await self.ipfs_unpin(cid)
+
+                self.shares.stop(
+                    share_id
+                )
 
 
-# ========== WEBSOCKET PROGRESS ==========
-async def websocket_progress(request):
-    share_id = request.match_info["share_id"]
-    if not share_id or share_id == "null":
-        return web.json_response({"error": "Invalid share ID"}, status=400)
+def create_owner_app(
+    service: FileShare,
+):
+    @web.middleware
+    async def owner_only(request, handler):
+        supplied = request.headers.get(
+            "X-FileShare-Auth",
+            "",
+        )
 
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    websocket_connections.setdefault(share_id, []).append(ws)
+        if not hmac.compare_digest(
+            supplied,
+            service.token,
+        ):
+            raise web.HTTPForbidden(
+                text="Owner authentication required"
+            )
+
+        return await handler(
+            request
+        )
+
+    app = web.Application(
+        middlewares=[owner_only],
+        client_max_size=MAX_BYTES,
+    )
+
+    app.router.add_post(
+        "/upload",
+        service.upload,
+    )
+
+    app.router.add_post(
+        "/stop/{share_id}",
+        service.stop,
+    )
+
+    app.router.add_get(
+        "/history",
+        service.history,
+    )
+
+    app.router.add_get(
+        "/ws/progress/{share_id}",
+        service.websocket,
+    )
+
+    app.router.add_get(
+        "/status/{share_id}",
+        service.status,
+    )
+
+    app.router.add_get(
+        "/",
+        service.frontend,
+    )
+
+    app.router.add_get(
+        "/static/{filename:.*}",
+        service.static,
+    )
+
+    app.router.add_get(
+        "/{filename:[^/]+}",
+        service.root_asset,
+    )
+
+    return app
+
+
+def create_public_app(
+    service: FileShare,
+):
+    app = web.Application()
+
+    # Only routes required by recipients.
+    # No upload, history, stop, or WebSocket APIs.
+    app.router.add_get(
+        "/download/{share_id}",
+        service.download,
+        allow_head=False,
+    )
+
+    app.router.add_get(
+        "/status/{share_id}",
+        service.status,
+    )
+
+    app.router.add_get(
+        "/",
+        service.frontend,
+    )
+
+    app.router.add_get(
+        "/static/{filename:.*}",
+        service.static,
+    )
+
+    app.router.add_get(
+        "/{filename:[^/]+}",
+        service.root_asset,
+    )
+
+    return app
+
+
+def validate_launch_environment(
+    runtime,
+):
+    expected = {
+        "FILESHARE_MODE": "development",
+        "FILESHARE_DB_PATH": str(
+            runtime.database
+        ),
+        "FILESHARE_IPFS_API": (
+            runtime.ipfs_api_url
+        ),
+        "FILESHARE_OWNER_PORT": str(
+            runtime.ports["owner"]
+        ),
+        "FILESHARE_PUBLIC_PORT": str(
+            runtime.ports["public"]
+        ),
+        "FILESHARE_TOR_CONTROL_PORT": str(
+            runtime.ports["tor_control"]
+        ),
+        "IPFS_PATH": str(
+            runtime.ipfs_repo
+        ),
+    }
+
+    for name, value in expected.items():
+        if os.environ.get(name) != value:
+            raise RuntimeError(
+                "Missing or incorrect "
+                "development environment: "
+                + name
+            )
+
+    token = os.environ.get(
+        "FILESHARE_ADMIN_TOKEN",
+        "",
+    )
+
+    if len(token) < 32:
+        raise RuntimeError(
+            "Missing authenticated owner session token"
+        )
+
+    return token
+
+
+async def main():
+    root = Path(__file__).resolve().parents[1]
+
+    runtime = load_development_runtime(
+        root
+    )
+
+    token = validate_launch_environment(
+        runtime
+    )
+
+    service = FileShare(
+        db_path=runtime.database,
+        temp_dir=runtime.temporary,
+        build_dir=(
+            root / "server" / "build"
+        ),
+        ipfs_api=runtime.ipfs_api_url,
+        token=token,
+        tor_port=runtime.ports["tor_control"],
+        clearnet_url=(
+            os.environ.get("CLEARNET_URL")
+            or None
+        ),
+    )
+
+    owner_runner = web.AppRunner(
+        create_owner_app(service)
+    )
+
+    public_runner = web.AppRunner(
+        create_public_app(service)
+    )
+
+    await public_runner.setup()
 
     try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT and msg.data == "close":
-                await ws.close()
-                break
-            elif msg.type == WSMsgType.ERROR:
-                break
-    finally:
-        conns = websocket_connections.get(share_id, [])
-        if ws in conns:
-            conns.remove(ws)
-        if not conns:
-            websocket_connections.pop(share_id, None)
-    return ws
+        await web.TCPSite(
+            public_runner,
+            "127.0.0.1",
+            runtime.ports["public"],
+        ).start()
 
+        await owner_runner.setup()
 
-# ========== OTHER ROUTES ==========
-async def stop_sharing(request):
-    share_id = request.match_info["share_id"]
-    ipfs_hash = share_metadata.stop_share(share_id)
-    if not ipfs_hash:
-        return web.json_response({"error": "Invalid share ID"}, status=404)
-    ipfs_pin_rm(ipfs_hash)
-    return web.json_response({"status": "stopped", "share_id": share_id})
-
-
-async def check_status(request):
-    share_id = request.match_info["share_id"]
-    return web.json_response({"active": share_metadata.is_active(share_id)})
-
-
-async def get_share_history(request):
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute("""
-            SELECT share_id, filename, max_downloads, download_count, active, expires_at
-            FROM share_metadata ORDER BY expires_at DESC
-        """)
-        rows = cur.fetchall()
-
-    result = []
-    for r in rows:
-        entry = {
-            "share_id": r[0],
-            "filename": r[1],
-            "max_downloads": r[2],
-            "download_count": r[3],
-            "active": bool(r[4]),
-            "expires_at": r[5],
-            "tor_link": f"http://{service_id}.onion/#/get/{r[0]}",
-        }
-        if clearnet_url:
-            entry["clearnet_link"] = f"{clearnet_url}/#/get/{r[0]}"
-        result.append(entry)
-
-    return web.json_response(result)
-
-
-# ========== MIDDLEWARE ==========
-@web.middleware
-async def cors_middleware(request, handler):
-    if request.method == "OPTIONS":
-        return web.Response(headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Accept, X-Requested-With",
-        })
-    response = await handler(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Expose-Headers"] = "X-Download-Token"
-    return response
-
-
-@web.middleware
-async def rate_limit_middleware(request, handler):
-    if request.method != "GET" or "download" not in request.path:
-        return await handler(request)
-    share_id = request.match_info.get("share_id")
-    if not share_id:
-        return await handler(request)
-    rate_limit_store[share_id] = rate_limit_store.get(share_id, 0) + 1
-    if rate_limit_store[share_id] > 10:
-        return web.json_response({"error": "Too many requests"}, status=429)
-
-    async def reset():
-        await asyncio.sleep(60)
-        rate_limit_store.pop(share_id, None)
-
-    asyncio.create_task(reset())
-    return await handler(request)
-
-
-# ========== CLEANUP ==========
-async def cleanup_expired_shares():
-    while True:
         try:
-            for share_id, ipfs_hash in share_metadata.get_all_expired():
-                ipfs_pin_rm(ipfs_hash)
-                share_metadata.stop_share(share_id)
-                logger.info(f"Cleaned up expired share: {share_id}")
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}", exc_info=True)
-        await asyncio.sleep(3600)
+            await web.TCPSite(
+                owner_runner,
+                "127.0.0.1",
+                runtime.ports["owner"],
+            ).start()
 
+            # Tor and Cloudflare process integration
+            # will be enabled only after the isolated
+            # desktop lifecycle has been tested.
+            LOG.info(
+                "Backend isolation ready. "
+                "Owner controls: %s; public: %s",
+                runtime.owner_url,
+                runtime.public_url,
+            )
 
-# ========== STARTUP ==========
-async def on_startup(app):
-    global tor_service, service_id, clearnet_url
-    tor_service = start_tor_service()
-    service_id = tor_service.service_id
-    logger.info(f"Tor hidden service started: {service_id}.onion")
-    clearnet_url = os.environ.get("CLEARNET_URL") or None
-    asyncio.create_task(cleanup_expired_shares())
+            service.cleanup_task = (
+                asyncio.create_task(
+                    service.cleanup_expired()
+                )
+            )
 
+            await asyncio.Event().wait()
 
-# ========== APP ==========
-app = web.Application(
-    middlewares=[cors_middleware, rate_limit_middleware],
-    client_max_size=50 * 1024**3
-)
+        finally:
+            if service.cleanup_task:
+                service.cleanup_task.cancel()
 
-# API routes first
-app.router.add_post("/upload", upload_file)
-app.router.add_get("/download/{share_id}", download_file)
-app.router.add_get("/download-progress/{token}", get_download_progress)
-app.router.add_get("/status/{share_id}", check_status)
-app.router.add_get("/ws/progress/{share_id}", websocket_progress)
-app.router.add_post("/stop/{share_id}", stop_sharing)
-app.router.add_get("/history", get_share_history)
-app.router.add_route("OPTIONS", "/{path_info:.*}", lambda r: web.Response())
+                await asyncio.gather(
+                    service.cleanup_task,
+                    return_exceptions=True,
+                )
 
-# Frontend routes after
-app.router.add_get('/', serve_frontend)
-app.router.add_get('/static/{filename:.*}', serve_static)
-app.router.add_get('/get/{share_id}', serve_frontend)
-app.router.add_get('/{filename:[^/]+}', serve_root_file)
+            await owner_runner.cleanup()
 
-app.on_startup.append(on_startup)
+    finally:
+        await public_runner.cleanup()
+
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=5000)
+    logging.basicConfig(
+        level=logging.INFO
+    )
+
+    asyncio.run(main())

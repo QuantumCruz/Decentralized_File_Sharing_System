@@ -1,414 +1,929 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react';
+
 import { QRCodeCanvas } from 'qrcode.react';
 import './App.css';
 
+
+const API = window.location.origin;
+const apiPath = path => `${API}${path}`;
+
+const buttonStyle = {
+  background: '#0b0f2b',
+  color: '#fff',
+  padding: '9px 14px',
+  border: 0,
+  borderRadius: 7,
+  cursor: 'pointer'
+};
+
+const panelStyle = {
+  background: '#fff',
+  color: '#111',
+  borderRadius: 12,
+  maxWidth: 850,
+  padding: 24,
+  margin: '0 auto 24px'
+};
+
+
 function App() {
   const [files, setFiles] = useState([]);
-  const [fileStatuses, setFileStatuses] = useState({});
-  const [shareData, setShareData] = useState([]);
-  const [uploadProgress, setUploadProgress] = useState({});
-  const [isUploading, setIsUploading] = useState(false);
+  const [zipName, setZipName] = useState('bundle.zip');
   const [maxDownloads, setMaxDownloads] = useState(1);
-  const [history, setHistory] = useState([]);
-  const [totalSize, setTotalSize] = useState(0);
-  const [zipName, setZipName] = useState("bundle.zip");
-  const [folderError, setFolderError] = useState(false);
-  const [sortOrder, setSortOrder] = useState('desc');
-  const [dateRange, setDateRange] = useState({ from: '', to: '' });
-  const [isOnline, setIsOnline] = useState(navigator.onLine);
-  const [uploadSpeed, setUploadSpeed] = useState(null); // Mbps
-  const uploadStartTime = useRef(null);
-  const lastProgressRef = useRef({ bytes: 0, time: Date.now() });
 
-  useEffect(() => {
-    const goOnline = () => setIsOnline(true);
-    const goOffline = () => setIsOnline(false);
-    window.addEventListener('online', goOnline);
-    window.addEventListener('offline', goOffline);
-    return () => {
-      window.removeEventListener('online', goOnline);
-      window.removeEventListener('offline', goOffline);
-    };
+  const [progress, setProgress] = useState(0);
+  const [uploadState, setUploadState] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const [history, setHistory] = useState([]);
+  const [historyError, setHistoryError] = useState('');
+  const [links, setLinks] = useState([]);
+
+  const [dateRange, setDateRange] = useState({
+    from: '',
+    to: ''
+  });
+
+  const [sortOrder, setSortOrder] = useState('desc');
+  const [online, setOnline] = useState(navigator.onLine);
+
+  const inputRef = useRef(null);
+  const socketRef = useRef(null);
+
+  const size = files.reduce(
+    (count, file) => count + file.size,
+    0
+  );
+
+  const displayName = files.length > 1
+    ? zipName
+    : (files[0]?.name || '');
+
+
+  const readJson = async (url, options = {}) => {
+    const response = await fetch(
+      apiPath(url),
+      options
+    );
+
+    const data = await response.json().catch(
+      () => ({})
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        data.error ||
+        `Request failed (${response.status})`
+      );
+    }
+
+    return data;
+  };
+
+
+  const refreshHistory = useCallback(async () => {
+    try {
+      const response = await fetch(
+        apiPath('/history'),
+        {
+          cache: 'no-store'
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(
+          `History request failed (${response.status})`
+        );
+      }
+
+      const data = await response.json();
+
+      if (!Array.isArray(data)) {
+        throw new Error(
+          'Unexpected history response'
+        );
+      }
+
+      setHistory(data);
+      setHistoryError('');
+
+    } catch (exc) {
+      setHistoryError(exc.message);
+    }
   }, []);
 
-  useEffect(() => { fetchHistory(); }, []);
-
-  const copyToClipboard = (text) => {
-    navigator.clipboard.writeText(text)
-      .then(() => alert("Copied to clipboard"))
-      .catch(() => alert("Failed to copy"));
-  };
-
-  const fetchHistory = async () => {
-    try {
-      const res = await fetch("http://localhost:5000/history");
-      const data = await res.json();
-      const filtered = data.filter(item => {
-        if (!dateRange.from && !dateRange.to) return true;
-        const expires = new Date(item.expires_at * 1000);
-        const from = dateRange.from ? new Date(dateRange.from) : null;
-        const to = dateRange.to ? new Date(dateRange.to) : null;
-        return (!from || expires >= from) && (!to || expires <= to);
-      });
-      setHistory([...filtered].sort((a, b) =>
-        sortOrder === 'asc' ? a.expires_at - b.expires_at : b.expires_at - a.expires_at
-      ));
-    } catch (err) {
-      console.error("Failed to fetch history:", err);
-    }
-  };
 
   useEffect(() => {
-    const interval = setInterval(async () => {
-      if (shareData.length === 0) return;
-      const updated = [];
-      for (const item of shareData) {
-        try {
-          const res = await fetch(`http://localhost:5000/status/${item.share_id}`);
-          const data = await res.json();
-          if (data.active) updated.push(item);
-        } catch {
-          updated.push(item);
-        }
-      }
-      setShareData(updated);
-      fetchHistory();
-    }, 10000);
-    return () => clearInterval(interval);
-  }, [shareData]);
+    refreshHistory();
 
-  const handleFileChange = (e) => {
-    const selected = Array.from(e.target.files);
-    setFiles(selected);
-    let sizeSum = 0;
-    const statusMap = {};
-    const progressMap = {};
-    selected.forEach(f => {
-      statusMap[f.name] = 'Pending';
-      progressMap[f.name] = 0;
-      sizeSum += f.size;
-    });
-    setFileStatuses(statusMap);
-    setUploadProgress(progressMap);
-    setTotalSize(sizeSum);
-    if (selected.length === 1) setZipName("bundle.zip");
+    const refreshTimer = window.setInterval(
+      refreshHistory,
+      10000
+    );
+
+    const onOnline = () => setOnline(true);
+    const onOffline = () => setOnline(false);
+
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+
+    return () => {
+      window.clearInterval(refreshTimer);
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, [refreshHistory]);
+
+
+  useEffect(() => () => {
+    if (socketRef.current) {
+      socketRef.current.close();
+    }
+  }, []);
+
+
+  const shownHistory = useMemo(
+    () => history.filter(item => {
+      const timestamp = item.expires_at * 1000;
+
+      const from = dateRange.from
+        ? new Date(
+            `${dateRange.from}T00:00:00`
+          ).getTime()
+        : -Infinity;
+
+      const to = dateRange.to
+        ? new Date(
+            `${dateRange.to}T23:59:59.999`
+          ).getTime()
+        : Infinity;
+
+      return timestamp >= from && timestamp <= to;
+
+    }).sort((a, b) => (
+      sortOrder === 'asc'
+        ? a.expires_at - b.expires_at
+        : b.expires_at - a.expires_at
+    )),
+    [history, dateRange, sortOrder]
+  );
+
+
+  const copy = async value => {
+    try {
+      await navigator.clipboard.writeText(
+        value
+      );
+
+      setError('');
+      setUploadState(
+        'Link copied to clipboard'
+      );
+
+    } catch (_) {
+      setError(
+        'Could not copy the link. ' +
+        'Select and copy it manually.'
+      );
+    }
   };
 
-  const handleUpload = async () => {
-    if (files.length === 0) return;
-    setIsUploading(true);
-    setUploadSpeed(null);
 
-    const shareId = Math.random().toString(36).substring(2, 18);
-    const formData = new FormData();
-    const bundled = files.length > 1;
-    const displayFilename = bundled ? zipName : files[0].name;
-    files.forEach(f => formData.append("files", f));
+  const selectFiles = selection => {
+    if (busy) {
+      return;
+    }
 
-    setFileStatuses({ [displayFilename]: 'Uploading...' });
-    setUploadProgress({ [displayFilename]: 0 });
+    setFiles(
+      Array.from(selection)
+    );
 
-    uploadStartTime.current = Date.now();
-    lastProgressRef.current = { bytes: 0, time: Date.now() };
+    setError('');
+    setProgress(0);
+    setUploadState('');
+  };
+
+
+  const onDrop = event => {
+    event.preventDefault();
+
+    if (busy) {
+      return;
+    }
+
+    const containsFolder = Array.from(
+      event.dataTransfer.items || []
+    ).some(
+      item => (
+        item.kind === 'file' &&
+        item.webkitGetAsEntry?.()?.isDirectory
+      )
+    );
+
+    if (containsFolder) {
+      setError(
+        'Folders cannot be selected directly. ' +
+        'Choose the files inside the folder.'
+      );
+      return;
+    }
+
+    selectFiles(
+      event.dataTransfer.files
+    );
+  };
+
+
+  const upload = async () => {
+    if (busy || files.length === 0) {
+      return;
+    }
+
+    setBusy(true);
+    setError('');
+    setProgress(0);
+
+    setUploadState(
+      'Connecting to FileShare...'
+    );
+
+    const id = window.crypto
+      .randomUUID()
+      .replaceAll('-', '');
+
+    const socketUrl = new URL(
+      `/ws/progress/${id}`,
+      API
+    );
+
+    socketUrl.protocol =
+      socketUrl.protocol === 'https:'
+        ? 'wss:'
+        : 'ws:';
+
+    let socket;
 
     try {
+      socket = new WebSocket(
+        socketUrl.toString()
+      );
+
+      socketRef.current = socket;
+
       await new Promise((resolve, reject) => {
-        const ws = new WebSocket(`ws://localhost:5000/ws/progress/${shareId}`);
-        ws.onopen = () => resolve(ws);
-        ws.onerror = () => {
-          setFileStatuses({ [displayFilename]: 'WebSocket error' });
-          reject(new Error("WebSocket failed"));
+        const timeout = window.setTimeout(
+          () => reject(
+            new Error(
+              'Progress connection timed out'
+            )
+          ),
+          15000
+        );
+
+        socket.onopen = () => {
+          window.clearTimeout(timeout);
+          resolve();
         };
-        ws.onmessage = e => {
-          const data = JSON.parse(e.data);
-          const now = Date.now();
-          const progress = data.progress;
 
-          // Calculate speed based on progress delta
-          const prevBytes = (lastProgressRef.current.bytes / 100) * totalSize;
-          const currBytes = (progress / 100) * totalSize;
-          const bytesDelta = currBytes - prevBytes;
-          const timeDelta = (now - lastProgressRef.current.time) / 1000; // seconds
+        socket.onerror = () => {
+          window.clearTimeout(timeout);
+          reject(
+            new Error(
+              'Progress connection failed'
+            )
+          );
+        };
 
-          if (timeDelta > 0 && bytesDelta > 0) {
-            const speedMbps = ((bytesDelta * 8) / timeDelta / 1_000_000).toFixed(2);
-            setUploadSpeed(speedMbps);
-          }
+        socket.onmessage = message => {
+          try {
+            const event = JSON.parse(
+              message.data
+            );
 
-          lastProgressRef.current = { bytes: progress, time: now };
-          setUploadProgress({ [displayFilename]: progress });
+            if (
+              typeof event.progress === 'number'
+            ) {
+              setProgress(
+                event.progress
+              );
+            }
 
-          if (progress >= 90 && progress < 100)
-            setFileStatuses({ [displayFilename]: 'Finalizing...' });
-          if (data.status === 'complete') {
-            setUploadProgress({ [displayFilename]: 100 });
-            setFileStatuses({ [displayFilename]: 'Uploaded' });
-            setUploadSpeed(null);
-            ws.close();
+            if (event.status) {
+              setUploadState(
+                event.status
+              );
+            }
+
+          } catch (_) {
+            // Ignore malformed progress events.
           }
         };
       });
 
-      const url = `http://localhost:5000/upload?share_id=${shareId}&max_downloads=${maxDownloads}${bundled ? `&zip_name=${encodeURIComponent(zipName)}` : ''}`;
-      const res = await fetch(url, { method: 'POST', body: formData });
-      const data = await res.json();
+      const params = new URLSearchParams({
+        share_id: id,
+        max_downloads: String(
+          maxDownloads
+        )
+      });
 
-      if (res.ok && Array.isArray(data.share_links)) {
-        setShareData(prev => [...prev, ...data.share_links.map(link => ({ ...link, filename: displayFilename }))]);
-        fetchHistory();
-      } else {
-        setFileStatuses({ [displayFilename]: 'Upload failed' });
+      if (files.length > 1) {
+        params.set(
+          'zip_name',
+          zipName
+        );
       }
-    } catch (err) {
-      console.error(err);
-      setFileStatuses({ [displayFilename]: 'Upload error' });
-    }
 
-    setIsUploading(false);
-    setFiles([]);
-    setFileStatuses({});
-    setUploadProgress({});
-    setTotalSize(0);
-    setZipName("bundle.zip");
-    setUploadSpeed(null);
+      const form = new FormData();
+
+      files.forEach(file => {
+        form.append(
+          'files',
+          file,
+          file.name
+        );
+      });
+
+      const data = await readJson(
+        `/upload?${params.toString()}`,
+        {
+          method: 'POST',
+          body: form
+        }
+      );
+
+      if (
+        !Array.isArray(data.share_links) ||
+        !data.share_links.length
+      ) {
+        throw new Error(
+          'Upload finished but no sharing link was returned'
+        );
+      }
+
+      setLinks(previous => [
+        ...data.share_links,
+        ...previous
+      ]);
+
+      setFiles([]);
+
+      if (inputRef.current) {
+        inputRef.current.value = '';
+      }
+
+      setProgress(100);
+      setUploadState(
+        'File ready to share'
+      );
+
+      await refreshHistory();
+
+    } catch (exc) {
+      setError(exc.message);
+      setUploadState(
+        'Upload failed'
+      );
+
+    } finally {
+      if (
+        socket &&
+        socket.readyState < WebSocket.CLOSING
+      ) {
+        socket.close();
+      }
+
+      socketRef.current = null;
+      setBusy(false);
+    }
   };
 
-  const stopShare = async (shareId) => {
+
+  const stop = async id => {
     try {
-      const res = await fetch(`http://localhost:5000/stop/${shareId}`, { method: "POST" });
-      const data = await res.json();
-      if (res.ok && data.status === "stopped") {
-        setShareData(prev => prev.filter(x => x.share_id !== shareId));
-        fetchHistory();
-      }
-    } catch (err) {
-      console.error(err);
+      await readJson(
+        `/stop/${encodeURIComponent(id)}`,
+        {
+          method: 'POST'
+        }
+      );
+
+      setLinks(previous => previous.filter(
+        link => link.share_id !== id
+      ));
+
+      setUploadState(
+        'Sharing stopped'
+      );
+
+      await refreshHistory();
+
+    } catch (exc) {
+      setError(
+        `Unable to stop sharing: ${exc.message}`
+      );
     }
   };
 
-  const displayFilename = files.length > 1 ? zipName : (files[0]?.name || '');
 
-  const btnStyle = {
-    padding: '6px 10px',
-    backgroundColor: '#0b0f2b',
-    color: '#fff',
-    border: 'none',
-    borderRadius: '6px',
-    cursor: 'pointer'
-  };
+  const grouped = Object.values(
+    links.reduce((result, link) => {
+      if (!result[link.share_id]) {
+        result[link.share_id] = {
+          shareId: link.share_id,
+          filename: link.filename,
+          max: link.max_downloads,
+          links: []
+        };
+      }
 
-  const groupedShares = shareData.reduce((acc, item) => {
-    if (!acc[item.share_id]) acc[item.share_id] = { ...item, links: [] };
-    acc[item.share_id].links.push({ url: item.share_link, type: item.link_type });
-    return acc;
-  }, {});
+      result[link.share_id].links.push(
+        link
+      );
+
+      return result;
+
+    }, {})
+  );
+
 
   return (
-    <>
-      <div id="animated-background"></div>
-      <div style={{ color: 'white', minHeight: '100vh', padding: '2rem', fontFamily: 'Inter, sans-serif' }}>
-        <h1 style={{ fontSize: '2rem', textAlign: 'center', marginBottom: '2rem' }}>📦 Decentralized File Share</h1>
+    <main
+      style={{
+        minHeight: '100vh',
+        background: '#0b0f2b',
+        color: '#fff',
+        padding: '32px 16px',
+        fontFamily: 'Inter, Arial, sans-serif'
+      }}
+    >
+      <h1
+        style={{
+          textAlign: 'center',
+          marginBottom: 30
+        }}
+      >
+        📦 FileShare Development
+      </h1>
 
-        <div style={{ backgroundColor: '#fff', color: '#000', padding: '1.5rem', borderRadius: '12px', maxWidth: '800px', margin: '0 auto' }}>
+      <section style={panelStyle}>
+        <h2 style={{ marginTop: 0 }}>
+          Share files privately
+        </h2>
 
-          {!isOnline && (
-            <div style={{ backgroundColor: '#ff4d4d', color: '#fff', padding: '1rem', borderRadius: '8px', marginBottom: '1rem', textAlign: 'center' }}>
-              ⚠️ No internet connection detected.
-            </div>
-          )}
+        <p>
+          Choose files, encrypt them locally,
+          then copy a private sharing link.
+        </p>
 
-          <div style={{ marginBottom: '1rem' }}>
-            <label><strong>Max Downloads:</strong>
-              <input
-                type="number"
-                value={maxDownloads}
-                onChange={e => setMaxDownloads(Math.max(1, parseInt(e.target.value) || 1))}
-                min="1"
-                style={{ marginLeft: '10px', padding: '4px 8px', borderRadius: '4px' }}
-              />
-            </label>
-          </div>
+        {!online && (
+          <p
+            role="alert"
+            style={{ color: '#b91c1c' }}
+          >
+            No internet connection detected.
+            Remote sharing may be unavailable.
+          </p>
+        )}
 
-          <div
-            onClick={() => document.getElementById('fileInput').click()}
-            onDragOver={e => e.preventDefault()}
-            onDrop={async e => {
-              e.preventDefault();
-              for (const item of e.dataTransfer.items) {
-                if (item.kind === 'file' && item.webkitGetAsEntry?.()?.isDirectory) {
-                  setFolderError(true);
-                  return;
-                }
-              }
-              setFolderError(false);
-              handleFileChange({ target: { files: e.dataTransfer.files } });
-            }}
+        {error && (
+          <p
+            role="alert"
             style={{
-              border: '2px dashed #ccc', padding: '40px', textAlign: 'center',
-              borderRadius: '12px', backgroundColor: '#0b0f2b', color: '#fff',
-              cursor: 'pointer', marginBottom: '1rem', fontSize: '16px'
+              color: '#b91c1c',
+              fontWeight: 600
             }}
           >
-            {files.length === 0 ? '📁 Click or Drag & Drop to choose files' : `${files.length} file(s) selected`}
-            <input id="fileInput" type="file" multiple onChange={handleFileChange} style={{ display: 'none' }} disabled={isUploading} />
-          </div>
+            {error}
+          </p>
+        )}
 
-          {folderError && (
-            <div style={{ backgroundColor: '#ff4d4d', color: '#fff', padding: '1rem', borderRadius: '8px', marginBottom: '1rem', textAlign: 'center' }}>
-              ❌ Folder uploads are not supported. Please select files only.
-            </div>
+        <div
+          onClick={() => (
+            !busy && inputRef.current?.click()
           )}
+          onDragOver={e => e.preventDefault()}
+          onDrop={onDrop}
+          style={{
+            border: '2px dashed #8a91ae',
+            borderRadius: 10,
+            padding: 32,
+            cursor: busy
+              ? 'not-allowed'
+              : 'pointer',
+            textAlign: 'center',
+            background: '#f5f7ff'
+          }}
+        >
+          <strong>
+            {files.length
+              ? `${files.length} file(s) selected`
+              : 'Click or drop files here'}
+          </strong>
 
-          {files.length > 1 && (
-            <>
-              <div style={{ backgroundColor: '#f5f5f5', padding: '10px', borderRadius: '8px', marginBottom: '1rem', fontSize: '14px' }}>
-                <strong>Selected Files:</strong>
-                <ul>
-                  {files.map((file, idx) => (
-                    <li key={idx}>{file.name} — {(file.size / 1024 / 1024).toFixed(2)} MB</li>
-                  ))}
-                </ul>
-              </div>
-              <div style={{ marginBottom: '1rem' }}>
-                <label><strong>ZIP Filename:</strong>
-                  <input
-                    type="text"
-                    value={zipName}
-                    onChange={e => setZipName(e.target.value.endsWith('.zip') ? e.target.value : e.target.value + ".zip")}
-                    style={{ marginLeft: '10px', padding: '4px 8px', borderRadius: '4px' }}
-                  />
-                </label>
-              </div>
-            </>
-          )}
-
-          {totalSize > 0 && <div style={{ marginBottom: '0.5rem' }}><strong>Total Size:</strong> {(totalSize / (1024 * 1024)).toFixed(2)} MB</div>}
-
-          <button
-            onClick={handleUpload}
-            disabled={isUploading || files.length === 0}
-            style={{ marginTop: '1rem', padding: '10px 20px', backgroundColor: '#0b0f2b', color: 'white', border: 'none', borderRadius: '6px', cursor: isUploading ? 'not-allowed' : 'pointer' }}
-          >
-            {isUploading ? 'Uploading...' : 'Upload'}
-          </button>
-
-          {displayFilename && uploadProgress[displayFilename] !== undefined && (
-            <div style={{ marginTop: '1rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '4px' }}>
-                <strong>{displayFilename}</strong>
-                {uploadSpeed && <span style={{ fontSize: '13px', color: '#555' }}>⚡ {uploadSpeed} Mbps</span>}
-              </div>
-              <div style={{ backgroundColor: '#e0e0e0', borderRadius: '6px', overflow: 'hidden', height: '12px' }}>
-                <div style={{
-                  width: `${uploadProgress[displayFilename]}%`,
-                  backgroundColor: '#0b0f2b',
-                  height: '100%',
-                  transition: 'width 0.3s ease'
-                }} />
-              </div>
-              <div style={{ fontSize: '13px', marginTop: '4px', color: '#333' }}>
-                {uploadProgress[displayFilename]}% — {fileStatuses[displayFilename]}
-              </div>
-            </div>
-          )}
+          <input
+            ref={inputRef}
+            type="file"
+            multiple
+            disabled={busy}
+            onChange={e => (
+              selectFiles(e.target.files)
+            )}
+            style={{
+              display: 'none'
+            }}
+          />
         </div>
 
-        {Object.values(groupedShares).length > 0 && (
-          <div style={{ marginTop: '2rem', maxWidth: '800px', margin: '2rem auto 0' }}>
-            <h2>🔗 Share Links</h2>
-            {Object.values(groupedShares).map(({ share_id, filename, max_downloads, links }) => (
-              <div key={share_id} style={{ backgroundColor: '#fff', color: '#000', borderRadius: '12px', padding: '1rem', marginBottom: '1rem' }}>
-                <p><strong>{filename}</strong></p>
-                {links.map(({ url, type }) => (
-                  <div key={type} style={{ marginBottom: '0.75rem' }}>
-                    <div style={{ fontSize: '12px', color: '#555', marginBottom: '4px' }}>
-                      {type === 'tor' ? '🧅 Tor (anonymous, slower)' : '🌐 Clearnet (fast, any browser)'}
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                      <a href={url} target="_blank" rel="noopener noreferrer" style={{ wordBreak: 'break-all' }}>{url}</a>
-                      <button onClick={() => copyToClipboard(url)} style={btnStyle}>📋 Copy</button>
-                    </div>
-                    <div style={{ marginTop: '8px' }}><QRCodeCanvas value={url} size={100} /></div>
-                  </div>
-                ))}
-                <p style={{ marginTop: '8px' }}>Maximum downloads: {max_downloads}</p>
-                <button onClick={() => stopShare(share_id)} style={btnStyle}>Stop Sharing</button>
-              </div>
-            ))}
+        {files.length > 0 && (
+          <div style={{ marginTop: 16 }}>
+            <p>
+              <strong>Total size:</strong>{' '}
+              {(size / 1024 / 1024).toFixed(2)} MB
+            </p>
+
+            <ul>
+              {files.map((file, i) => (
+                <li key={`${file.name}-${i}`}>
+                  {file.name}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 
-        {(history.length > 0 || dateRange.from || dateRange.to) && (
-          <div style={{ marginTop: '2rem', maxWidth: '800px', margin: '2rem auto 0' }}>
-            <h2>📜 History</h2>
-            <div style={{ marginBottom: '10px', display: 'flex', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
-              <label style={{ color: 'white' }}>Sort:
-                <select value={sortOrder} onChange={e => setSortOrder(e.target.value)}
-                  style={{ marginLeft: '5px', padding: '4px 8px', borderRadius: '4px' }}>
-                  <option value="desc">Latest First</option>
-                  <option value="asc">Earliest First</option>
-                </select>
-              </label>
-              <label style={{ color: 'white' }}>From:
-                <input type="date" value={dateRange.from}
-                  onChange={e => setDateRange(prev => ({ ...prev, from: e.target.value }))}
-                  style={{ marginLeft: '5px', padding: '4px 8px', borderRadius: '4px' }} />
-              </label>
-              <label style={{ color: 'white' }}>To:
-                <input type="date" value={dateRange.to}
-                  onChange={e => setDateRange(prev => ({ ...prev, to: e.target.value }))}
-                  style={{ marginLeft: '5px', padding: '4px 8px', borderRadius: '4px' }} />
-              </label>
-              <button onClick={() => setDateRange({ from: '', to: '' })} style={{ ...btnStyle, padding: '6px 12px' }}>Clear Filters</button>
-              <button onClick={fetchHistory} style={{ ...btnStyle, padding: '6px 12px' }}>🔄 Refresh</button>
-            </div>
+        {files.length > 1 && (
+          <label
+            style={{
+              display: 'block',
+              margin: '15px 0'
+            }}
+          >
+            ZIP filename:{' '}
 
-            {history.length === 0 ? (
-              <p style={{ color: 'white', textAlign: 'center', marginTop: '2rem' }}>No history</p>
-            ) : history.map(item => (
-              <div key={item.share_id} style={{ backgroundColor: '#fff', color: '#000', borderRadius: '12px', padding: '1rem', marginBottom: '1rem' }}>
-                <strong>{item.filename}</strong><br />
+            <input
+              value={zipName}
+              disabled={busy}
+              onChange={e => (
+                setZipName(e.target.value)
+              )}
+            />
+          </label>
+        )}
 
-                <div style={{ marginTop: '6px' }}>
-                  <div style={{ fontSize: '12px', color: '#555' }}>🧅 Tor</div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                    <a href={item.tor_link} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all' }}>{item.tor_link}</a>
-                    {item.active && (
-                      <button onClick={() => copyToClipboard(item.tor_link)} style={btnStyle}>📋 Copy</button>
+        <label
+          style={{
+            display: 'block',
+            margin: '15px 0'
+          }}
+        >
+          Maximum downloads:{' '}
+
+          <input
+            type="number"
+            min="1"
+            max="100000"
+            value={maxDownloads}
+            disabled={busy}
+            onChange={e => (
+              setMaxDownloads(
+                Math.max(
+                  1,
+                  Math.min(
+                    100000,
+                    Number.parseInt(
+                      e.target.value,
+                      10
+                    ) || 1
+                  )
+                )
+              )
+            )}
+          />
+        </label>
+
+        <button
+          style={buttonStyle}
+          disabled={
+            busy ||
+            !files.length
+          }
+          onClick={upload}
+        >
+          {busy ? 'Uploading...' : 'Share files'}
+        </button>
+
+        {(uploadState || busy) && (
+          <div
+            style={{ marginTop: 16 }}
+            role="status"
+          >
+            <strong>
+              {displayName || 'Transfer'}:
+              {' '}{uploadState}
+            </strong>
+
+            <progress
+              style={{
+                display: 'block',
+                width: '100%',
+                marginTop: 8
+              }}
+              max="100"
+              value={progress}
+            />
+
+            <span>{progress}%</span>
+          </div>
+        )}
+      </section>
+
+      {grouped.length > 0 && (
+        <section style={panelStyle}>
+          <h2>New sharing links</h2>
+
+          {grouped.map(group => (
+            <article
+              key={group.shareId}
+              style={{
+                padding: '16px 0',
+                borderBottom: '1px solid #ddd'
+              }}
+            >
+              <h3>{group.filename}</h3>
+
+              {group.links.map(link => (
+                <div
+                  key={link.link_type}
+                  style={{
+                    marginBottom: 12
+                  }}
+                >
+                  <strong>
+                    {link.link_type === 'tor'
+                      ? '🧅 Tor (private network)'
+                      : '🌐 HTTPS (regular browsers)'}
+                  </strong>
+
+                  <p
+                    style={{
+                      overflowWrap: 'anywhere'
+                    }}
+                  >
+                    <a
+                      href={link.share_link}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {link.share_link}
+                    </a>
+                  </p>
+
+                  <button
+                    style={buttonStyle}
+                    onClick={() => copy(
+                      link.share_link
                     )}
+                  >
+                    Copy link
+                  </button>
+
+                  <div
+                    style={{ marginTop: 8 }}
+                  >
+                    <QRCodeCanvas
+                      size={100}
+                      value={link.share_link}
+                    />
                   </div>
                 </div>
+              ))}
+
+              <p>
+                Maximum downloads: {group.max}
+              </p>
+
+              <button
+                style={buttonStyle}
+                onClick={() => stop(
+                  group.shareId
+                )}
+              >
+                Stop sharing
+              </button>
+            </article>
+          ))}
+        </section>
+      )}
+
+      <section style={panelStyle}>
+        <h2>History</h2>
+
+        {historyError && (
+          <p
+            role="alert"
+            style={{
+              color: '#b91c1c'
+            }}
+          >
+            Unable to update history:
+            {' '}{historyError}
+          </p>
+        )}
+
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            alignItems: 'center',
+            gap: 10
+          }}
+        >
+          <label>
+            Sort:{' '}
+
+            <select
+              value={sortOrder}
+              onChange={e => (
+                setSortOrder(e.target.value)
+              )}
+            >
+              <option value="desc">
+                Latest first
+              </option>
+              <option value="asc">
+                Earliest first
+              </option>
+            </select>
+          </label>
+
+          <label>
+            From:{' '}
+
+            <input
+              type="date"
+              value={dateRange.from}
+              onChange={e => (
+                setDateRange(value => ({
+                  ...value,
+                  from: e.target.value
+                }))
+              )}
+            />
+          </label>
+
+          <label>
+            To:{' '}
+
+            <input
+              type="date"
+              value={dateRange.to}
+              onChange={e => (
+                setDateRange(value => ({
+                  ...value,
+                  to: e.target.value
+                }))
+              )}
+            />
+          </label>
+
+          <button
+            style={buttonStyle}
+            onClick={() => setDateRange({
+              from: '',
+              to: ''
+            })}
+          >
+            Clear filters
+          </button>
+
+          <button
+            style={buttonStyle}
+            onClick={refreshHistory}
+          >
+            Refresh
+          </button>
+        </div>
+
+        {!shownHistory.length && (
+          <p>No shares in this date range.</p>
+        )}
+
+        {shownHistory.map(item => (
+          <article
+            key={item.share_id}
+            style={{
+              borderBottom: '1px solid #ddd',
+              padding: '16px 0'
+            }}
+          >
+            <h3
+              style={{
+                margin: '0 0 8px'
+              }}
+            >
+              {item.filename}
+            </h3>
+
+            <p>
+              Downloads:
+              {' '}{item.download_count}/
+              {item.max_downloads}
+              {' — '}
+              {item.active
+                ? 'Active'
+                : 'Expired or stopped'}
+            </p>
+
+            <p>
+              Expires:
+              {' '}
+              {new Date(
+                item.expires_at * 1000
+              ).toLocaleString()}
+            </p>
+
+            {item.active && (
+              <>
+                {item.tor_link && (
+                  <p
+                    style={{
+                      overflowWrap: 'anywhere'
+                    }}
+                  >
+                    Tor:{' '}
+
+                    <a
+                      href={item.tor_link}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {item.tor_link}
+                    </a>
+
+                    {' '}
+
+                    <button
+                      onClick={() => copy(
+                        item.tor_link
+                      )}
+                    >
+                      Copy
+                    </button>
+                  </p>
+                )}
 
                 {item.clearnet_link && (
-                  <div style={{ marginTop: '6px' }}>
-                    <div style={{ fontSize: '12px', color: '#555' }}>🌐 Clearnet</div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                      <a href={item.clearnet_link} target="_blank" rel="noreferrer" style={{ wordBreak: 'break-all' }}>{item.clearnet_link}</a>
-                      {item.active && (
-                        <button onClick={() => copyToClipboard(item.clearnet_link)} style={btnStyle}>📋 Copy</button>
+                  <p
+                    style={{
+                      overflowWrap: 'anywhere'
+                    }}
+                  >
+                    HTTPS:{' '}
+
+                    <a
+                      href={item.clearnet_link}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {item.clearnet_link}
+                    </a>
+
+                    {' '}
+
+                    <button
+                      onClick={() => copy(
+                        item.clearnet_link
                       )}
-                    </div>
-                  </div>
+                    >
+                      Copy
+                    </button>
+                  </p>
                 )}
 
-                <div style={{ marginTop: '8px', fontSize: '14px' }}>
-                  Downloads: {item.download_count} / {item.max_downloads}<br />
-                  Status: <span style={{ color: item.active ? 'green' : 'red', fontWeight: 'bold' }}>
-                    {item.active ? "Active" : "Expired/Stopped"}
-                  </span><br />
-                  Expires: {new Date(item.expires_at * 1000).toLocaleString()}
-                </div>
-
-                {item.active && (
-                  <button onClick={() => stopShare(item.share_id)} style={{ marginTop: '8px', ...btnStyle }}>Stop Sharing</button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </>
+                <button
+                  style={buttonStyle}
+                  onClick={() => stop(
+                    item.share_id
+                  )}
+                >
+                  Stop sharing
+                </button>
+              </>
+            )}
+          </article>
+        ))}
+      </section>
+    </main>
   );
 }
+
 
 export default App;
