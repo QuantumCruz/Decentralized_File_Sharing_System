@@ -1,58 +1,91 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 
 function Download() {
-    const [status, setStatus] = useState('Loading...');
     const { shareId } = useParams();
+    const [status, setStatus] = useState('Preparing download...');
+    const [error, setError] = useState(null);
+
+    const baseUrl = window.location.origin.includes('localhost')
+        ? 'http://localhost:5000'
+        : window.location.origin;
 
     useEffect(() => {
-        const downloadFile = async () => {
+        const startDownload = async () => {
             try {
-                const res = await fetch(`http://localhost:5000/download/${shareId}`);
-                if (!res.ok) throw new Error('Invalid or expired link');
+                setStatus('Checking file...');
 
-                const disposition = res.headers.get('Content-Disposition');
-                const filenameMatch = /filename="(.+?)"/.exec(disposition);
-                const filename = filenameMatch ? filenameMatch[1] : 'downloaded_file';
+                const check = await fetch(`${baseUrl}/status/${shareId}`);
 
-                const contentType = res.headers.get('Content-Type') || 'application/octet-stream';
-
-                const stream = res.body;
-                const reader = stream.getReader();
-                const chunks = [];
-                let receivedLength = 0;
-
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    chunks.push(value);
-                    receivedLength += value.length;
-                    console.log(`Downloaded ${receivedLength} bytes...`);
+                if (!check.ok) {
+                    setError('Invalid or expired link');
+                    return;
                 }
 
+                const data = await check.json();
 
-                const blob = new Blob(chunks, { type: contentType });
-                const url = URL.createObjectURL(blob);
+                if (!data.active) {
+                    setError('This share link is no longer active');
+                    return;
+                }
+
+                setStatus('Starting download...');
 
                 const a = document.createElement('a');
-                a.href = url;
-                a.download = filename;
+                a.href = `${baseUrl}/download/${shareId}`;
+                a.rel = 'noopener noreferrer';
+                document.body.appendChild(a);
                 a.click();
+                document.body.removeChild(a);
 
-                URL.revokeObjectURL(url);
-                setStatus('Download complete');
+                setStatus('Download started. Check your browser downloads.');
             } catch (err) {
-                setStatus('Invalid or expired link');
+                setError(`Download failed: ${err.message}`);
             }
         };
 
-        downloadFile();
-    }, [shareId]);
+        startDownload();
+    }, [shareId, baseUrl]);
+
+    const containerStyle = {
+        minHeight: '100vh',
+        backgroundColor: '#0b0f2b',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontFamily: 'Inter, sans-serif',
+        color: 'white',
+        padding: '2rem',
+    };
+
+    const cardStyle = {
+        backgroundColor: '#fff',
+        color: '#000',
+        borderRadius: '12px',
+        padding: '2rem',
+        maxWidth: '480px',
+        width: '100%',
+        textAlign: 'center',
+        boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
+    };
 
     return (
-        <div className="App">
-            <h1>File Download</h1>
-            <p>{status}</p>
+        <div style={containerStyle}>
+            <div style={cardStyle}>
+                {error ? (
+                    <>
+                        <div style={{ fontSize: '2rem' }}>❌</div>
+                        <h2>Download Failed</h2>
+                        <p style={{ color: '#dc2626' }}>{error}</p>
+                    </>
+                ) : (
+                    <>
+                        <div style={{ fontSize: '2rem' }}>📥</div>
+                        <h2>Downloading File</h2>
+                        <p style={{ marginTop: '1rem', color: '#333' }}>{status}</p>
+                    </>
+                )}
+            </div>
         </div>
     );
 }

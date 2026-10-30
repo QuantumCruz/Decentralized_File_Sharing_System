@@ -2,19 +2,19 @@
   "name": "file-share",
   "version": "1.0.0",
   "private": true,
-  "description": "Desktop version of decentralized file sharing app",
-  "author": "Your Name",
+  "description": "Decentralized file sharing app",
+  "author": "Testimony Akinlabi",
   "main": "public/electron.js",
-  "homepage": "./",
+  "homepage": "/",
   "scripts": {
     "start": "react-scripts start",
-    "build": "react-scripts build",
+    "build": "react-scripts build && xcopy /E /Y build server\\build\\ /I",
     "electron": "electron .",
     "package": "npm run build && electron-builder"
   },
   "build": {
     "appId": "com.fileshare.desktop",
-    "productName": "FileShareApp",
+    "productName": "FileShare",
     "files": [
       "public/electron.js"
     ],
@@ -22,10 +22,6 @@
       {
         "from": "server",
         "to": "server"
-      },
-      {
-        "from": "build",
-        "to": "build"
       },
       {
         "from": "binaries",
@@ -36,32 +32,23 @@
       "buildResources": "assets"
     },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "assets/icon.ico"
     }
   },
   "dependencies": {
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-scripts": "5.0.1",
-    "axios": "^1.9.0",
-    "qrcode.react": "^4.2.0",
-    "ipfs-http-client": "^60.0.1",
-    "socket.io-client": "^4.8.1"
+    "react-router-dom": "^6.0.0",
+    "qrcode.react": "^4.2.0"
   },
   "devDependencies": {
     "electron": "^28.1.0",
     "electron-builder": "^24.6.4"
   },
   "browserslist": {
-    "production": [
-      ">0.2%",
-      "not dead",
-      "not op_mini all"
-    ],
-    "development": [
-      "last 1 chrome version",
-      "last 1 firefox version",
-      "last 1 safari version"
-    ]
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version", "last 1 firefox version", "last 1 safari version"]
   }
 }

@@ -9,7 +9,7 @@ root.render(
   <Router>
     <Routes>
       <Route path="/" element={<App />} />
-      <Route path="/:shareId" element={<Download />} />
+      <Route path="/get/:shareId" element={<Download />} />
     </Routes>
   </Router>
 );
