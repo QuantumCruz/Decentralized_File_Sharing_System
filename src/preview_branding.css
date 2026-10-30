@@ -1,10 +1,23 @@
-/* The packaged application is branded by Electron.
-   Hide development-stage labels in the React dashboard. */
+/* FileShare branded preview interface.
+   Does not alter backend or transfer functionality. */
 
 .fs-dev-tag {
   display: none !important;
 }
 
 .fs-footer {
+  display: none !important;
+}
+
+.fs-brand-mark {
+  background-image: url("/fileshare-icon.png") !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+  background-size: cover !important;
+  border-radius: 11px !important;
+  box-shadow: 0 5px 16px rgba(29, 99, 207, 0.24) !important;
+}
+
+.fs-brand-mark svg {
   display: none !important;
 }

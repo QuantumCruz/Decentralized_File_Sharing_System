@@ -41,5 +41,20 @@
     "output": "dist-preview",
     "buildResources": "assets"
   },
-  "win": {}
+  "win": {
+    "target": [
+      "nsis"
+    ],
+    "icon": "assets/icon.ico"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "assets/icon.ico",
+    "uninstallerIcon": "assets/icon.ico",
+    "artifactName": "FileShare-Preview-Setup-${version}-${arch}.${ext}"
+  }
 }
