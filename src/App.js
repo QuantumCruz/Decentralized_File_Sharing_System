@@ -1,929 +1,559 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState
-} from 'react';
-
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { QRCodeCanvas } from 'qrcode.react';
 import './App.css';
 
+const MAX_FILES = 100;
+const MAX_BYTES = 5 * 1024 ** 3;
 
-const API = window.location.origin;
-const apiPath = path => `${API}${path}`;
-
-const buttonStyle = {
-  background: '#0b0f2b',
-  color: '#fff',
-  padding: '9px 14px',
-  border: 0,
-  borderRadius: 7,
-  cursor: 'pointer'
+const symbols = {
+  upload: <><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></>,
+  file: <><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h6"/></>,
+  shield: <><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"/><path d="m9 12 2 2 4-4"/></>,
+  link: <><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></>,
+  copy: <><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>,
+  check: <path d="m5 12 4 4L19 6"/>,
+  close: <><path d="M18 6 6 18M6 6l12 12"/></>,
+  refresh: <><path d="M20 11a8 8 0 0 0-14.7-4.3L3 9"/><path d="M3 3v6h6"/><path d="M4 13a8 8 0 0 0 14.7 4.3L21 15"/><path d="M15 15h6v6"/></>,
+  stop: <><circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" rx="1"/></>,
+  qr: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM21 14v4M17 21h4M14 21v-2"/></>,
+  globe: <><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a16 16 0 0 1 0 18M12 3a16 16 0 0 0 0 18"/></>,
+  clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
+  arrow: <><path d="M5 12h14M13 6l6 6-6 6"/></>,
+  sparkle: <><path d="m12 3 1.8 6.2L20 11l-6.2 1.8L12 19l-1.8-6.2L4 11l6.2-1.8L12 3Z"/><path d="m19 18 .6 1.4L21 20l-1.4.6L19 22l-.6-1.4L17 20l1.4-.6L19 18Z"/></>,
 };
 
-const panelStyle = {
-  background: '#fff',
-  color: '#111',
-  borderRadius: 12,
-  maxWidth: 850,
-  padding: 24,
-  margin: '0 auto 24px'
-};
+function Icon({ name, size = 20 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      {symbols[name] || symbols.file}
+    </svg>
+  );
+}
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length);
+  return `${(bytes / (1024 ** exponent)).toFixed(exponent > 1 ? 2 : 1)} ${units[exponent - 1]}`;
+}
+
+function formatDate(seconds) {
+  return new Date(seconds * 1000).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
+  });
+}
+
+function stageLabel(stage) {
+  const labels = {
+    connecting: 'Establishing secure connection',
+    encrypting: 'Encrypting your files',
+    'uploading to IPFS': 'Publishing encrypted file',
+    finalizing: 'Preparing your private links',
+    complete: 'Ready to share'
+  };
+  return labels[stage] || (stage ? stage.charAt(0).toUpperCase() + stage.slice(1) : 'Preparing upload');
+}
 
 function App() {
-  const [files, setFiles] = useState([]);
-  const [zipName, setZipName] = useState('bundle.zip');
-  const [maxDownloads, setMaxDownloads] = useState(1);
-
-  const [progress, setProgress] = useState(0);
-  const [uploadState, setUploadState] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-
-  const [history, setHistory] = useState([]);
-  const [historyError, setHistoryError] = useState('');
-  const [links, setLinks] = useState([]);
-
-  const [dateRange, setDateRange] = useState({
-    from: '',
-    to: ''
-  });
-
-  const [sortOrder, setSortOrder] = useState('desc');
-  const [online, setOnline] = useState(navigator.onLine);
-
   const inputRef = useRef(null);
   const socketRef = useRef(null);
 
-  const size = files.reduce(
-    (count, file) => count + file.size,
-    0
-  );
+  const [files, setFiles] = useState([]);
+  const [zipName, setZipName] = useState('bundle.zip');
+  const [maxDownloads, setMaxDownloads] = useState(1);
+  const [dragging, setDragging] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [transfer, setTransfer] = useState(null);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [copiedUrl, setCopiedUrl] = useState('');
+  const [shareLinks, setShareLinks] = useState([]);
+  const [qrUrl, setQrUrl] = useState('');
+  const [stoppingId, setStoppingId] = useState('');
+  const [history, setHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState('');
+  const [sortOrder, setSortOrder] = useState('desc');
+  const [dateRange, setDateRange] = useState({ from: '', to: '' });
+  const [online, setOnline] = useState(navigator.onLine);
 
-  const displayName = files.length > 1
-    ? zipName
-    : (files[0]?.name || '');
-
-
-  const readJson = async (url, options = {}) => {
-    const response = await fetch(
-      apiPath(url),
-      options
-    );
-
-    const data = await response.json().catch(
-      () => ({})
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        data.error ||
-        `Request failed (${response.status})`
-      );
-    }
-
-    return data;
-  };
-
+  const totalBytes = useMemo(() => files.reduce((sum, file) => sum + file.size, 0), [files]);
 
   const refreshHistory = useCallback(async () => {
     try {
-      const response = await fetch(
-        apiPath('/history'),
-        {
-          cache: 'no-store'
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error(
-          `History request failed (${response.status})`
-        );
-      }
-
+      const response = await fetch('/history', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`History unavailable (${response.status})`);
       const data = await response.json();
-
-      if (!Array.isArray(data)) {
-        throw new Error(
-          'Unexpected history response'
-        );
-      }
-
+      if (!Array.isArray(data)) throw new Error('Unexpected history response');
       setHistory(data);
       setHistoryError('');
-
-    } catch (exc) {
-      setHistoryError(exc.message);
+    } catch (err) {
+      setHistoryError(err.message || 'Unable to load history');
+    } finally {
+      setHistoryLoading(false);
     }
   }, []);
-
 
   useEffect(() => {
     refreshHistory();
-
-    const refreshTimer = window.setInterval(
-      refreshHistory,
-      10000
-    );
-
-    const onOnline = () => setOnline(true);
-    const onOffline = () => setOnline(false);
-
-    window.addEventListener('online', onOnline);
-    window.addEventListener('offline', onOffline);
-
+    const timer = window.setInterval(refreshHistory, 10000);
+    const connected = () => setOnline(true);
+    const disconnected = () => setOnline(false);
+    window.addEventListener('online', connected);
+    window.addEventListener('offline', disconnected);
     return () => {
-      window.clearInterval(refreshTimer);
-      window.removeEventListener('online', onOnline);
-      window.removeEventListener('offline', onOffline);
+      window.clearInterval(timer);
+      window.removeEventListener('online', connected);
+      window.removeEventListener('offline', disconnected);
+      socketRef.current?.close();
     };
   }, [refreshHistory]);
 
+  const filteredHistory = useMemo(() => {
+    const from = dateRange.from ? new Date(`${dateRange.from}T00:00:00`).getTime() : -Infinity;
+    const to = dateRange.to ? new Date(`${dateRange.to}T23:59:59.999`).getTime() : Infinity;
+    return history
+      .filter(item => item.expires_at * 1000 >= from && item.expires_at * 1000 <= to)
+      .sort((a, b) => sortOrder === 'asc' ? a.expires_at - b.expires_at : b.expires_at - a.expires_at);
+  }, [history, dateRange, sortOrder]);
 
-  useEffect(() => () => {
-    if (socketRef.current) {
-      socketRef.current.close();
-    }
-  }, []);
-
-
-  const shownHistory = useMemo(
-    () => history.filter(item => {
-      const timestamp = item.expires_at * 1000;
-
-      const from = dateRange.from
-        ? new Date(
-            `${dateRange.from}T00:00:00`
-          ).getTime()
-        : -Infinity;
-
-      const to = dateRange.to
-        ? new Date(
-            `${dateRange.to}T23:59:59.999`
-          ).getTime()
-        : Infinity;
-
-      return timestamp >= from && timestamp <= to;
-
-    }).sort((a, b) => (
-      sortOrder === 'asc'
-        ? a.expires_at - b.expires_at
-        : b.expires_at - a.expires_at
-    )),
-    [history, dateRange, sortOrder]
+  const activeRecordById = useMemo(
+    () => new Map(history.map(item => [item.share_id, item.active])),
+    [history]
   );
 
-
-  const copy = async value => {
-    try {
-      await navigator.clipboard.writeText(
-        value
-      );
-
-      setError('');
-      setUploadState(
-        'Link copied to clipboard'
-      );
-
-    } catch (_) {
-      setError(
-        'Could not copy the link. ' +
-        'Select and copy it manually.'
-      );
-    }
-  };
-
-
-  const selectFiles = selection => {
-    if (busy) {
-      return;
-    }
-
-    setFiles(
-      Array.from(selection)
-    );
-
-    setError('');
-    setProgress(0);
-    setUploadState('');
-  };
-
-
-  const onDrop = event => {
-    event.preventDefault();
-
-    if (busy) {
-      return;
-    }
-
-    const containsFolder = Array.from(
-      event.dataTransfer.items || []
-    ).some(
-      item => (
-        item.kind === 'file' &&
-        item.webkitGetAsEntry?.()?.isDirectory
-      )
-    );
-
-    if (containsFolder) {
-      setError(
-        'Folders cannot be selected directly. ' +
-        'Choose the files inside the folder.'
-      );
-      return;
-    }
-
-    selectFiles(
-      event.dataTransfer.files
-    );
-  };
-
-
-  const upload = async () => {
-    if (busy || files.length === 0) {
-      return;
-    }
-
-    setBusy(true);
-    setError('');
-    setProgress(0);
-
-    setUploadState(
-      'Connecting to FileShare...'
-    );
-
-    const id = window.crypto
-      .randomUUID()
-      .replaceAll('-', '');
-
-    const socketUrl = new URL(
-      `/ws/progress/${id}`,
-      API
-    );
-
-    socketUrl.protocol =
-      socketUrl.protocol === 'https:'
-        ? 'wss:'
-        : 'ws:';
-
-    let socket;
-
-    try {
-      socket = new WebSocket(
-        socketUrl.toString()
-      );
-
-      socketRef.current = socket;
-
-      await new Promise((resolve, reject) => {
-        const timeout = window.setTimeout(
-          () => reject(
-            new Error(
-              'Progress connection timed out'
-            )
-          ),
-          15000
-        );
-
-        socket.onopen = () => {
-          window.clearTimeout(timeout);
-          resolve();
-        };
-
-        socket.onerror = () => {
-          window.clearTimeout(timeout);
-          reject(
-            new Error(
-              'Progress connection failed'
-            )
-          );
-        };
-
-        socket.onmessage = message => {
-          try {
-            const event = JSON.parse(
-              message.data
-            );
-
-            if (
-              typeof event.progress === 'number'
-            ) {
-              setProgress(
-                event.progress
-              );
-            }
-
-            if (event.status) {
-              setUploadState(
-                event.status
-              );
-            }
-
-          } catch (_) {
-            // Ignore malformed progress events.
-          }
-        };
-      });
-
-      const params = new URLSearchParams({
-        share_id: id,
-        max_downloads: String(
-          maxDownloads
-        )
-      });
-
-      if (files.length > 1) {
-        params.set(
-          'zip_name',
-          zipName
-        );
-      }
-
-      const form = new FormData();
-
-      files.forEach(file => {
-        form.append(
-          'files',
-          file,
-          file.name
-        );
-      });
-
-      const data = await readJson(
-        `/upload?${params.toString()}`,
-        {
-          method: 'POST',
-          body: form
-        }
-      );
-
-      if (
-        !Array.isArray(data.share_links) ||
-        !data.share_links.length
-      ) {
-        throw new Error(
-          'Upload finished but no sharing link was returned'
-        );
-      }
-
-      setLinks(previous => [
-        ...data.share_links,
-        ...previous
-      ]);
-
-      setFiles([]);
-
-      if (inputRef.current) {
-        inputRef.current.value = '';
-      }
-
-      setProgress(100);
-      setUploadState(
-        'File ready to share'
-      );
-
-      await refreshHistory();
-
-    } catch (exc) {
-      setError(exc.message);
-      setUploadState(
-        'Upload failed'
-      );
-
-    } finally {
-      if (
-        socket &&
-        socket.readyState < WebSocket.CLOSING
-      ) {
-        socket.close();
-      }
-
-      socketRef.current = null;
-      setBusy(false);
-    }
-  };
-
-
-  const stop = async id => {
-    try {
-      await readJson(
-        `/stop/${encodeURIComponent(id)}`,
-        {
-          method: 'POST'
-        }
-      );
-
-      setLinks(previous => previous.filter(
-        link => link.share_id !== id
-      ));
-
-      setUploadState(
-        'Sharing stopped'
-      );
-
-      await refreshHistory();
-
-    } catch (exc) {
-      setError(
-        `Unable to stop sharing: ${exc.message}`
-      );
-    }
-  };
-
-
-  const grouped = Object.values(
-    links.reduce((result, link) => {
-      if (!result[link.share_id]) {
-        result[link.share_id] = {
+  const recentShares = useMemo(() => {
+    const grouped = new Map();
+    for (const link of shareLinks) {
+      if (!grouped.has(link.share_id)) {
+        grouped.set(link.share_id, {
           shareId: link.share_id,
           filename: link.filename,
           max: link.max_downloads,
           links: []
-        };
+        });
+      }
+      grouped.get(link.share_id).links.push(link);
+    }
+    return [...grouped.values()].filter(
+      share => activeRecordById.get(share.shareId) !== false
+    );
+  }, [shareLinks, activeRecordById]);
+
+  const chooseFiles = selection => {
+    if (uploading) return;
+    const selected = Array.from(selection || []);
+    setFiles(selected);
+    setError('');
+    setNotice('');
+    setTransfer(null);
+    if (inputRef.current) inputRef.current.value = '';
+  };
+
+  const handleDrop = event => {
+    event.preventDefault();
+    setDragging(false);
+    if (uploading) return;
+    const folder = Array.from(event.dataTransfer.items || []).some(item =>
+      item.kind === 'file' && item.webkitGetAsEntry?.()?.isDirectory
+    );
+    if (folder) {
+      setError('Please select files, not folders. Multiple files are bundled into a ZIP automatically.');
+      return;
+    }
+    chooseFiles(event.dataTransfer.files);
+  };
+
+  const removeFile = index => {
+    if (uploading) return;
+    setFiles(current => current.filter((_, i) => i !== index));
+    setError('');
+  };
+
+  const copy = async url => {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopiedUrl(url);
+      setNotice('Link copied to clipboard');
+      setError('');
+    } catch (_) {
+      setError('Could not copy automatically. Select the link and copy it manually.');
+    }
+  };
+
+  const upload = async () => {
+    if (uploading || !files.length) return;
+    if (files.length > MAX_FILES) {
+      setError(`Choose up to ${MAX_FILES} files at a time.`);
+      return;
+    }
+    if (totalBytes > MAX_BYTES) {
+      setError('Your selected files exceed the 5 GB upload limit.');
+      return;
+    }
+    if (files.length > 1 && new Set(files.map(file => file.name)).size !== files.length) {
+      setError('Two selected files have the same name. Please rename one before bundling.');
+      return;
+    }
+    if (files.length > 1 && !zipName.trim()) {
+      setError('Enter a name for your ZIP file.');
+      return;
+    }
+
+    setUploading(true);
+    setError('');
+    setNotice('');
+    setTransfer({ progress: 0, stage: 'connecting' });
+
+    const shareId = window.crypto.randomUUID().replace(/-/g, '');
+    const socketUrl = new URL(`/ws/progress/${shareId}`, window.location.origin);
+    socketUrl.protocol = socketUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    let socket;
+
+    try {
+      socket = new WebSocket(socketUrl.toString());
+      socketRef.current = socket;
+      await new Promise((resolve, reject) => {
+        let opened = false;
+        const timeout = window.setTimeout(() => {
+          if (opened) return;
+          socket.close();
+          reject(new Error('The transfer connection timed out. Please try again.'));
+        }, 12000);
+        socket.addEventListener('open', () => {
+          opened = true;
+          window.clearTimeout(timeout);
+          resolve();
+        }, { once: true });
+        socket.addEventListener('error', () => {
+          if (!opened) {
+            window.clearTimeout(timeout);
+            reject(new Error('Unable to establish the transfer connection.'));
+          }
+        }, { once: true });
+        socket.addEventListener('message', event => {
+          try {
+            const data = JSON.parse(event.data);
+            setTransfer(previous => ({
+              progress: typeof data.progress === 'number'
+                ? Math.max(0, Math.min(100, data.progress))
+                : (previous?.progress || 0),
+              stage: data.status || previous?.stage || 'encrypting'
+            }));
+          } catch (_) {
+            // Ignore invalid progress notifications; the HTTP request remains authoritative.
+          }
+        });
+      });
+
+      const params = new URLSearchParams({
+        share_id: shareId,
+        max_downloads: String(maxDownloads)
+      });
+      if (files.length > 1) params.set('zip_name', zipName.trim());
+
+      const body = new FormData();
+      files.forEach(file => body.append('files', file, file.name));
+      const response = await fetch(`/upload?${params.toString()}`, { method: 'POST', body });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Upload failed (${response.status})`);
+      if (!Array.isArray(data.share_links) || !data.share_links.length) {
+        throw new Error('Upload completed but no sharing link was returned.');
       }
 
-      result[link.share_id].links.push(
-        link
-      );
+      setShareLinks(current => [...data.share_links, ...current]);
+      setTransfer({ progress: 100, stage: 'complete' });
+      setNotice('File encrypted and ready to share. Copy a link below.');
+      setFiles([]);
+      setZipName('bundle.zip');
+      await refreshHistory();
+    } catch (err) {
+      setError(err.message || 'Unable to upload your file');
+      setTransfer(null);
+    } finally {
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+      socketRef.current = null;
+      setUploading(false);
+    }
+  };
 
-      return result;
+  const stopShare = async shareId => {
+    if (stoppingId) return;
+    if (!window.confirm('Stop sharing this file? Existing links will no longer work.')) return;
+    setStoppingId(shareId);
+    setError('');
+    try {
+      const response = await fetch(`/stop/${encodeURIComponent(shareId)}`, { method: 'POST' });
+      if (!response.ok) throw new Error(`Unable to stop sharing (${response.status})`);
+      setShareLinks(current => current.filter(item => item.share_id !== shareId));
+      setQrUrl('');
+      setNotice('Sharing stopped. Existing links are no longer active.');
+      await refreshHistory();
+    } catch (err) {
+      setError(err.message || 'Unable to stop sharing');
+    } finally {
+      setStoppingId('');
+    }
+  };
 
-    }, {})
-  );
-
+  const selectedName = files.length > 1 ? (zipName || 'bundle.zip') : (files[0]?.name || '');
+  const activeCount = history.filter(item => item.active).length;
 
   return (
-    <main
-      style={{
-        minHeight: '100vh',
-        background: '#0b0f2b',
-        color: '#fff',
-        padding: '32px 16px',
-        fontFamily: 'Inter, Arial, sans-serif'
-      }}
-    >
-      <h1
-        style={{
-          textAlign: 'center',
-          marginBottom: 30
-        }}
-      >
-        📦 FileShare Development
-      </h1>
-
-      <section style={panelStyle}>
-        <h2 style={{ marginTop: 0 }}>
-          Share files privately
-        </h2>
-
-        <p>
-          Choose files, encrypt them locally,
-          then copy a private sharing link.
-        </p>
-
-        {!online && (
-          <p
-            role="alert"
-            style={{ color: '#b91c1c' }}
-          >
-            No internet connection detected.
-            Remote sharing may be unavailable.
-          </p>
-        )}
-
-        {error && (
-          <p
-            role="alert"
-            style={{
-              color: '#b91c1c',
-              fontWeight: 600
-            }}
-          >
-            {error}
-          </p>
-        )}
-
-        <div
-          onClick={() => (
-            !busy && inputRef.current?.click()
-          )}
-          onDragOver={e => e.preventDefault()}
-          onDrop={onDrop}
-          style={{
-            border: '2px dashed #8a91ae',
-            borderRadius: 10,
-            padding: 32,
-            cursor: busy
-              ? 'not-allowed'
-              : 'pointer',
-            textAlign: 'center',
-            background: '#f5f7ff'
-          }}
-        >
-          <strong>
-            {files.length
-              ? `${files.length} file(s) selected`
-              : 'Click or drop files here'}
-          </strong>
-
-          <input
-            ref={inputRef}
-            type="file"
-            multiple
-            disabled={busy}
-            onChange={e => (
-              selectFiles(e.target.files)
-            )}
-            style={{
-              display: 'none'
-            }}
-          />
+    <div className="fs-shell">
+      <div id="animated-background" aria-hidden="true" />
+      <header className="fs-topbar">
+        <div className="fs-brand">
+          <span className="fs-brand-mark"><Icon name="link" size={22} /></span>
+          <span className="fs-brand-name">FileShare<span className="fs-brand-dot">.</span></span>
+          <span className="fs-dev-tag">DEVELOPMENT</span>
         </div>
+        <div className="fs-topbar-right">
+          <span className={`fs-connection ${online ? 'fs-online' : 'fs-offline'}`}>
+            <span className="fs-connection-dot" />{online ? 'Network online' : 'Network offline'}
+          </span>
+        </div>
+      </header>
 
-        {files.length > 0 && (
-          <div style={{ marginTop: 16 }}>
-            <p>
-              <strong>Total size:</strong>{' '}
-              {(size / 1024 / 1024).toFixed(2)} MB
-            </p>
+      <main className="fs-content">
+        <section className="fs-hero">
+          <span className="fs-eyebrow"><Icon name="sparkle" size={15} /> PRIVATE BY DESIGN</span>
+          <h1>Your files. <span>Your rules.</span></h1>
+          <p>Send files securely, share a link, and stay in control of who can download them.</p>
+        </section>
 
-            <ul>
-              {files.map((file, i) => (
-                <li key={`${file.name}-${i}`}>
-                  {file.name}
-                </li>
-              ))}
-            </ul>
+        {(error || notice) && (
+          <div className={`fs-alert ${error ? 'fs-alert-error' : 'fs-alert-success'}`}
+            role={error ? 'alert' : 'status'}>
+            <Icon name={error ? 'close' : 'check'} size={19} />
+            <span>{error || notice}</span>
+            <button className="fs-alert-dismiss" type="button" aria-label="Dismiss message"
+              onClick={() => { setError(''); setNotice(''); }}><Icon name="close" size={17} /></button>
           </div>
         )}
 
-        {files.length > 1 && (
-          <label
-            style={{
-              display: 'block',
-              margin: '15px 0'
-            }}
-          >
-            ZIP filename:{' '}
+        <div className="fs-main-grid">
+          <section className="fs-panel fs-upload-panel" aria-labelledby="upload-heading">
+            <div className="fs-section-heading">
+              <span className="fs-section-icon"><Icon name="upload" size={22} /></span>
+              <div>
+                <h2 id="upload-heading">Send a file</h2>
+                <p>Encrypted before it leaves your computer.</p>
+              </div>
+            </div>
 
-            <input
-              value={zipName}
-              disabled={busy}
-              onChange={e => (
-                setZipName(e.target.value)
-              )}
-            />
-          </label>
-        )}
+            <input ref={inputRef} className="fs-visually-hidden" type="file" multiple
+              aria-label="Select files to share" onChange={event => chooseFiles(event.target.files)} />
+            <button type="button"
+              className={`fs-dropzone ${dragging ? 'fs-dropzone-active' : ''}`}
+              disabled={uploading}
+              onClick={() => inputRef.current?.click()}
+              onDragEnter={event => { event.preventDefault(); setDragging(true); }}
+              onDragOver={event => event.preventDefault()}
+              onDragLeave={event => { event.preventDefault(); setDragging(false); }}
+              onDrop={handleDrop}>
+              <span className="fs-drop-icon"><Icon name="upload" size={29} /></span>
+              <strong>{files.length ? `${files.length} file${files.length === 1 ? '' : 's'} selected` : 'Drop your files here'}</strong>
+              <span>{files.length ? 'Click to choose different files' : 'or click to browse your computer'}</span>
+              <small>Up to 100 files · 5 GB total</small>
+            </button>
 
-        <label
-          style={{
-            display: 'block',
-            margin: '15px 0'
-          }}
-        >
-          Maximum downloads:{' '}
-
-          <input
-            type="number"
-            min="1"
-            max="100000"
-            value={maxDownloads}
-            disabled={busy}
-            onChange={e => (
-              setMaxDownloads(
-                Math.max(
-                  1,
-                  Math.min(
-                    100000,
-                    Number.parseInt(
-                      e.target.value,
-                      10
-                    ) || 1
-                  )
-                )
-              )
+            {files.length > 0 && (
+              <div className="fs-selected">
+                <div className="fs-selected-top">
+                  <span>SELECTED FILES</span>
+                  <button type="button" disabled={uploading} className="fs-text-button"
+                    onClick={() => chooseFiles([])}>Clear all</button>
+                </div>
+                <div className="fs-file-list">
+                  {files.map((file, index) => (
+                    <div className="fs-file-row" key={`${file.name}-${file.lastModified}-${index}`}>
+                      <span className="fs-file-icon"><Icon name="file" size={18} /></span>
+                      <div className="fs-file-details">
+                        <strong title={file.name}>{file.name}</strong>
+                        <small>{formatBytes(file.size)}</small>
+                      </div>
+                      <button type="button" className="fs-icon-button" disabled={uploading}
+                        aria-label={`Remove ${file.name}`} onClick={() => removeFile(index)}>
+                        <Icon name="close" size={17} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <div className="fs-file-total"><span>Total</span><strong>{formatBytes(totalBytes)}</strong></div>
+              </div>
             )}
-          />
-        </label>
 
-        <button
-          style={buttonStyle}
-          disabled={
-            busy ||
-            !files.length
-          }
-          onClick={upload}
-        >
-          {busy ? 'Uploading...' : 'Share files'}
-        </button>
+            <div className="fs-options">
+              <label className="fs-field">
+                <span>Download limit</span>
+                <input type="number" min="1" max="100000" value={maxDownloads} disabled={uploading}
+                  onChange={event => setMaxDownloads(Math.min(100000, Math.max(1, Number.parseInt(event.target.value, 10) || 1)))} />
+                <small>Link stops working after this many downloads.</small>
+              </label>
+              {files.length > 1 && (
+                <label className="fs-field">
+                  <span>ZIP filename</span>
+                  <input type="text" value={zipName} disabled={uploading}
+                    onChange={event => setZipName(event.target.value)} placeholder="bundle.zip" />
+                  <small>Selected files will be bundled automatically.</small>
+                </label>
+              )}
+            </div>
 
-        {(uploadState || busy) && (
-          <div
-            style={{ marginTop: 16 }}
-            role="status"
-          >
-            <strong>
-              {displayName || 'Transfer'}:
-              {' '}{uploadState}
-            </strong>
+            {transfer && (
+              <div className={`fs-transfer ${transfer.stage === 'complete' ? 'fs-transfer-done' : ''}`} role="status">
+                <div className="fs-transfer-header">
+                  <span><Icon name={transfer.stage === 'complete' ? 'check' : 'file'} size={17} /> {stageLabel(transfer.stage)}</span>
+                  <strong>{Math.round(transfer.progress)}%</strong>
+                </div>
+                <div className="fs-progress-track"><div className="fs-progress-fill"
+                  style={{ width: `${transfer.progress}%` }} /></div>
+                {uploading && <small>{selectedName}</small>}
+              </div>
+            )}
 
-            <progress
-              style={{
-                display: 'block',
-                width: '100%',
-                marginTop: 8
-              }}
-              max="100"
-              value={progress}
-            />
+            <button className="fs-primary-button" type="button" disabled={!files.length || uploading}
+              onClick={upload}>
+              <Icon name={uploading ? 'refresh' : 'arrow'} size={19} />
+              {uploading ? 'Securing and uploading...' : 'Create sharing link'}
+            </button>
+            <p className="fs-upload-footnote"><Icon name="shield" size={15} /> Your files are encrypted before publishing.</p>
+          </section>
 
-            <span>{progress}%</span>
-          </div>
-        )}
-      </section>
+          <aside className="fs-side-column">
+            <section className="fs-panel fs-links-panel" aria-labelledby="links-heading">
+              <div className="fs-section-heading fs-compact-heading">
+                <span className="fs-section-icon fs-teal-icon"><Icon name="link" size={21} /></span>
+                <div>
+                  <h2 id="links-heading">Fresh links</h2>
+                  <p>Ready to send to anyone.</p>
+                </div>
+              </div>
 
-      {grouped.length > 0 && (
-        <section style={panelStyle}>
-          <h2>New sharing links</h2>
-
-          {grouped.map(group => (
-            <article
-              key={group.shareId}
-              style={{
-                padding: '16px 0',
-                borderBottom: '1px solid #ddd'
-              }}
-            >
-              <h3>{group.filename}</h3>
-
-              {group.links.map(link => (
-                <div
-                  key={link.link_type}
-                  style={{
-                    marginBottom: 12
-                  }}
-                >
-                  <strong>
-                    {link.link_type === 'tor'
-                      ? '🧅 Tor (private network)'
-                      : '🌐 HTTPS (regular browsers)'}
-                  </strong>
-
-                  <p
-                    style={{
-                      overflowWrap: 'anywhere'
-                    }}
-                  >
-                    <a
-                      href={link.share_link}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {link.share_link}
-                    </a>
-                  </p>
-
-                  <button
-                    style={buttonStyle}
-                    onClick={() => copy(
-                      link.share_link
-                    )}
-                  >
-                    Copy link
-                  </button>
-
-                  <div
-                    style={{ marginTop: 8 }}
-                  >
-                    <QRCodeCanvas
-                      size={100}
-                      value={link.share_link}
-                    />
+              {!recentShares.length ? (
+                <div className="fs-empty-links">
+                  <span className="fs-empty-illustration"><Icon name="link" size={30} /></span>
+                  <h3>No links yet</h3>
+                  <p>Upload a file and its private sharing links will appear here.</p>
+                </div>
+              ) : recentShares.map(share => (
+                <div className="fs-share-card" key={share.shareId}>
+                  <div className="fs-share-title">
+                    <span className="fs-file-icon"><Icon name="file" size={19} /></span>
+                    <div><strong title={share.filename}>{share.filename}</strong><small>{share.max} download{share.max === 1 ? '' : 's'} allowed</small></div>
                   </div>
+                  {share.links.map(link => (
+                    <div className="fs-share-link" key={`${share.shareId}-${link.link_type}`}>
+                      <div className="fs-share-link-label"><Icon name={link.link_type === 'tor' ? 'shield' : 'globe'} size={15} />
+                        {link.link_type === 'tor' ? 'Tor private link' : 'HTTPS link · works in any browser'}
+                      </div>
+                      <div className="fs-link-actions">
+                        <a href={link.share_link} title={link.share_link} target="_blank" rel="noreferrer">{link.share_link}</a>
+                        <button type="button" className="fs-small-button" onClick={() => copy(link.share_link)}>
+                          <Icon name={copiedUrl === link.share_link ? 'check' : 'copy'} size={15} />
+                          {copiedUrl === link.share_link ? 'Copied' : 'Copy'}
+                        </button>
+                        <button type="button" className="fs-icon-button fs-qr-button"
+                          aria-label="Show QR code" title="Show QR code"
+                          onClick={() => setQrUrl(current => current === link.share_link ? '' : link.share_link)}>
+                          <Icon name="qr" size={17} />
+                        </button>
+                      </div>
+                      {qrUrl === link.share_link && (
+                        <div className="fs-qr-wrap"><QRCodeCanvas value={link.share_link} size={132} marginSize={1} />
+                          <span>Scan to open on your phone</span></div>
+                      )}
+                    </div>
+                  ))}
+                  <button type="button" className="fs-stop-link" disabled={Boolean(stoppingId)}
+                    onClick={() => stopShare(share.shareId)}>
+                    <Icon name="stop" size={16} /> {stoppingId === share.shareId ? 'Stopping...' : 'Stop sharing'}
+                  </button>
                 </div>
               ))}
+            </section>
 
-              <p>
-                Maximum downloads: {group.max}
-              </p>
-
-              <button
-                style={buttonStyle}
-                onClick={() => stop(
-                  group.shareId
-                )}
-              >
-                Stop sharing
-              </button>
-            </article>
-          ))}
-        </section>
-      )}
-
-      <section style={panelStyle}>
-        <h2>History</h2>
-
-        {historyError && (
-          <p
-            role="alert"
-            style={{
-              color: '#b91c1c'
-            }}
-          >
-            Unable to update history:
-            {' '}{historyError}
-          </p>
-        )}
-
-        <div
-          style={{
-            display: 'flex',
-            flexWrap: 'wrap',
-            alignItems: 'center',
-            gap: 10
-          }}
-        >
-          <label>
-            Sort:{' '}
-
-            <select
-              value={sortOrder}
-              onChange={e => (
-                setSortOrder(e.target.value)
-              )}
-            >
-              <option value="desc">
-                Latest first
-              </option>
-              <option value="asc">
-                Earliest first
-              </option>
-            </select>
-          </label>
-
-          <label>
-            From:{' '}
-
-            <input
-              type="date"
-              value={dateRange.from}
-              onChange={e => (
-                setDateRange(value => ({
-                  ...value,
-                  from: e.target.value
-                }))
-              )}
-            />
-          </label>
-
-          <label>
-            To:{' '}
-
-            <input
-              type="date"
-              value={dateRange.to}
-              onChange={e => (
-                setDateRange(value => ({
-                  ...value,
-                  to: e.target.value
-                }))
-              )}
-            />
-          </label>
-
-          <button
-            style={buttonStyle}
-            onClick={() => setDateRange({
-              from: '',
-              to: ''
-            })}
-          >
-            Clear filters
-          </button>
-
-          <button
-            style={buttonStyle}
-            onClick={refreshHistory}
-          >
-            Refresh
-          </button>
+            <section className="fs-guide-panel">
+              <div className="fs-guide-title"><Icon name="shield" size={19} /> Secure sharing, made simple</div>
+              <div className="fs-guide-item"><span>01</span><p><strong>Select</strong> one or more files.</p></div>
+              <div className="fs-guide-item"><span>02</span><p><strong>Share</strong> the generated link or QR code.</p></div>
+              <div className="fs-guide-item"><span>03</span><p><strong>Stay in control</strong> with download limits and revocation.</p></div>
+            </section>
+          </aside>
         </div>
 
-        {!shownHistory.length && (
-          <p>No shares in this date range.</p>
-        )}
+        <section className="fs-panel fs-history-panel" aria-labelledby="history-heading">
+          <div className="fs-history-top">
+            <div className="fs-section-heading fs-compact-heading">
+              <span className="fs-section-icon"><Icon name="clock" size={21} /></span>
+              <div>
+                <h2 id="history-heading">Sharing history</h2>
+                <p>{activeCount} active · {history.length} total shares</p>
+              </div>
+            </div>
+            <button className="fs-outline-button" type="button" onClick={refreshHistory}>
+              <Icon name="refresh" size={17} /> Refresh
+            </button>
+          </div>
 
-        {shownHistory.map(item => (
-          <article
-            key={item.share_id}
-            style={{
-              borderBottom: '1px solid #ddd',
-              padding: '16px 0'
-            }}
-          >
-            <h3
-              style={{
-                margin: '0 0 8px'
-              }}
-            >
-              {item.filename}
-            </h3>
+          <div className="fs-filters">
+            <label>Sort <select value={sortOrder} onChange={event => setSortOrder(event.target.value)}>
+              <option value="desc">Newest first</option><option value="asc">Oldest first</option>
+            </select></label>
+            <label>From <input type="date" value={dateRange.from}
+              onChange={event => setDateRange(current => ({ ...current, from: event.target.value }))} /></label>
+            <label>To <input type="date" value={dateRange.to}
+              onChange={event => setDateRange(current => ({ ...current, to: event.target.value }))} /></label>
+            <button className="fs-text-button" type="button" onClick={() => setDateRange({ from: '', to: '' })}>Clear filters</button>
+          </div>
 
-            <p>
-              Downloads:
-              {' '}{item.download_count}/
-              {item.max_downloads}
-              {' — '}
-              {item.active
-                ? 'Active'
-                : 'Expired or stopped'}
-            </p>
-
-            <p>
-              Expires:
-              {' '}
-              {new Date(
-                item.expires_at * 1000
-              ).toLocaleString()}
-            </p>
-
-            {item.active && (
-              <>
-                {item.tor_link && (
-                  <p
-                    style={{
-                      overflowWrap: 'anywhere'
-                    }}
-                  >
-                    Tor:{' '}
-
-                    <a
-                      href={item.tor_link}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {item.tor_link}
-                    </a>
-
-                    {' '}
-
-                    <button
-                      onClick={() => copy(
-                        item.tor_link
-                      )}
-                    >
-                      Copy
-                    </button>
-                  </p>
-                )}
-
-                {item.clearnet_link && (
-                  <p
-                    style={{
-                      overflowWrap: 'anywhere'
-                    }}
-                  >
-                    HTTPS:{' '}
-
-                    <a
-                      href={item.clearnet_link}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      {item.clearnet_link}
-                    </a>
-
-                    {' '}
-
-                    <button
-                      onClick={() => copy(
-                        item.clearnet_link
-                      )}
-                    >
-                      Copy
-                    </button>
-                  </p>
-                )}
-
-                <button
-                  style={buttonStyle}
-                  onClick={() => stop(
-                    item.share_id
-                  )}
-                >
-                  Stop sharing
-                </button>
-              </>
-            )}
-          </article>
-        ))}
-      </section>
-    </main>
+          {historyError && <p className="fs-history-error" role="alert">{historyError}</p>}
+          {historyLoading ? (
+            <div className="fs-history-empty">Loading your sharing history...</div>
+          ) : !filteredHistory.length ? (
+            <div className="fs-history-empty"><Icon name="clock" size={26} />
+              <p>{history.length ? 'No shares match your filters.' : 'Your shared files will appear here.'}</p>
+            </div>
+          ) : (
+            <div className="fs-history-scroll">
+              <table className="fs-history-table">
+                <thead><tr><th>FILE</th><th>DOWNLOADS</th><th>EXPIRY</th><th>STATUS</th><th>ACTIONS</th></tr></thead>
+                <tbody>{filteredHistory.map(item => {
+                  const preferredLink = item.clearnet_link || item.tor_link;
+                  return (
+                    <tr key={item.share_id}>
+                      <td><div className="fs-history-file"><span className="fs-file-icon"><Icon name="file" size={17} /></span>
+                        <strong title={item.filename}>{item.filename}</strong></div></td>
+                      <td><span className="fs-count">{item.download_count} / {item.max_downloads}</span></td>
+                      <td className="fs-date">{formatDate(item.expires_at)}</td>
+                      <td><span className={`fs-status-badge ${item.active ? 'fs-active' : 'fs-inactive'}`}>
+                        <span />{item.active ? 'Active' : 'Inactive'}</span></td>
+                      <td><div className="fs-history-actions">
+                        {item.active && preferredLink && (
+                          <button className="fs-small-button" type="button" onClick={() => copy(preferredLink)}
+                            title="Copy sharing link"><Icon name="copy" size={15} /> Copy</button>
+                        )}
+                        {item.active && (
+                          <button className="fs-icon-button fs-danger-button" type="button"
+                            disabled={Boolean(stoppingId)} title="Stop sharing" aria-label={`Stop sharing ${item.filename}`}
+                            onClick={() => stopShare(item.share_id)}><Icon name="stop" size={17} /></button>
+                        )}
+                        {!item.active && <span className="fs-muted">—</span>}
+                      </div></td>
+                    </tr>
+                  );
+                })}</tbody>
+              </table>
+            </div>
+          )}
+        </section>
+        <footer className="fs-footer"><Icon name="shield" size={15} /> FileShare Development · Local control, private transfers.</footer>
+      </main>
+    </div>
   );
 }
-
 
 export default App;
