@@ -1,0 +1,51 @@
+{
+  "appId": "com.quantumcruz.fileshare",
+  "productName": "FileShare by QuantumCruz",
+  "extraMetadata": {
+    "main": "public/stable_electron.js"
+  },
+  "files": [
+    "public/stable_electron.js",
+    "package.json"
+  ],
+  "asar": true,
+  "extraResources": [
+    {
+      "from": "dist-stable/backend",
+      "to": "backend",
+      "filter": ["stable_server.exe"]
+    },
+    {
+      "from": "binaries",
+      "to": "binaries",
+      "filter": ["ipfs.exe", "tor.exe", "cloudflared.exe", "*.dll", "geoip", "geoip6"]
+    },
+    {
+      "from": "server/build",
+      "to": "server/build",
+      "filter": ["**/*"]
+    },
+    {
+      "from": "assets/icon.ico",
+      "to": "assets/icon.ico"
+    }
+  ],
+  "directories": {
+    "output": "dist-stable",
+    "buildResources": "assets"
+  },
+  "win": {
+    "target": ["nsis"],
+    "icon": "assets/icon.ico"
+  },
+  "nsis": {
+    "oneClick": false,
+    "perMachine": false,
+    "allowToChangeInstallationDirectory": true,
+    "createDesktopShortcut": true,
+    "createStartMenuShortcut": true,
+    "installerIcon": "assets/icon.ico",
+    "uninstallerIcon": "assets/icon.ico",
+    "artifactName": "FileShare-Setup-${version}-${arch}.${ext}"
+  }
+}

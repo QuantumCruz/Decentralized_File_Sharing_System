@@ -1,5 +1,6 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
+
 import {
   HashRouter,
   Routes,
@@ -10,17 +11,21 @@ import App from './App';
 import Download from './download';
 import './preview_branding.css';
 
-// Only explicit loopback OWNER ports render the management dashboard.
-// Public services use separate ports and never expose owner API routes.
+
+// These ports belong to the isolated development,
+// preview and stable application respectively.
+// Actual authentication is always enforced by the backend.
 const ownerPorts = new Set([
   '15300',
-  '25300'
+  '25300',
+  '35300'
 ]);
 
 const isOwner = (
   window.location.hostname === '127.0.0.1' &&
   ownerPorts.has(window.location.port)
 );
+
 
 function PublicLanding() {
   return (
@@ -42,6 +47,7 @@ function PublicLanding() {
         }}
       >
         <h1>FileShare</h1>
+
         <p>
           Use the private sharing link you received
           to download a file.
@@ -50,6 +56,7 @@ function PublicLanding() {
     </main>
   );
 }
+
 
 ReactDOM.createRoot(
   document.getElementById('root')
@@ -64,6 +71,7 @@ ReactDOM.createRoot(
             : <PublicLanding />
         }
       />
+
       <Route
         path="/get/:shareId"
         element={<Download />}

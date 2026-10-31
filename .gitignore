@@ -15,17 +15,18 @@ venv/
 .coverage
 htmlcov/
 
-# Bundled binaries and build artifacts
+# Generated binaries and application builds
 /binaries
 /build
 /dist
-/dist-preview/
+/dist-preview
+/dist-stable
 /server/dist
 /server/build
 *.exe
 *.asar
 
-# Sensitive local application data
+# Local application data
 /server/metadata.db
 /.fileshare-dev/
 
