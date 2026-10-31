@@ -13,7 +13,7 @@ const symbols = {
   copy: <><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>,
   check: <path d="m5 12 4 4L19 6"/>,
   close: <><path d="M18 6 6 18M6 6l12 12"/></>,
-  refresh: <><path d="M20 11a8 8 0 0 0-14.7-4.3L3 9"/><path d="M3 3v6h6"/><path d="M4 13a8 8 0 0 0 14.7 4.3L21 15"/><path d="M15 15h6v6"/></>,
+  refresh: <><path d="M20 11a8 8 0 0 0-14.7-4.3L3 9"/><path d="M3 3v6h6"/><path d="M4 13a8 8 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/><path d="M20 11a8 8 0 0 0-14.7-4.3L3 9"/><path d="M3 3v6h6"/><path d="M4 13a8 8 0 0 0 14.7 4.3L21 15"/><path d="M15 15h6v6"/></>,
   stop: <><circle cx="12" cy="12" r="9"/><rect x="9" y="9" width="6" height="6" rx="1"/></>,
   qr: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM21 14v4M17 21h4M14 21v-2"/></>,
   globe: <><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a16 16 0 0 1 0 18M12 3a16 16 0 0 0 0 18"/></>,
@@ -40,9 +40,26 @@ function formatBytes(bytes) {
 }
 
 function formatDate(seconds) {
-  return new Date(seconds * 1000).toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit'
-  });
+  const timestamp = Number(seconds) * 1000;
+
+  if (!Number.isFinite(timestamp)) {
+    return 'Unknown date';
+  }
+
+  const date = new Date(timestamp);
+
+  if (Number.isNaN(date.getTime())) {
+    return 'Unknown date';
+  }
+
+  try {
+    return date.toLocaleString(undefined, {
+      dateStyle: 'medium',
+      timeStyle: 'short'
+    });
+  } catch (_) {
+    return date.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  }
 }
 
 function stageLabel(stage) {
@@ -521,31 +538,60 @@ function App() {
             <div className="fs-history-scroll">
               <table className="fs-history-table">
                 <thead><tr><th>FILE</th><th>DOWNLOADS</th><th>EXPIRY</th><th>STATUS</th><th>ACTIONS</th></tr></thead>
-                <tbody>{filteredHistory.map(item => {
-                  const preferredLink = item.clearnet_link || item.tor_link;
-                  return (
-                    <tr key={item.share_id}>
-                      <td><div className="fs-history-file"><span className="fs-file-icon"><Icon name="file" size={17} /></span>
-                        <strong title={item.filename}>{item.filename}</strong></div></td>
-                      <td><span className="fs-count">{item.download_count} / {item.max_downloads}</span></td>
-                      <td className="fs-date">{formatDate(item.expires_at)}</td>
-                      <td><span className={`fs-status-badge ${item.active ? 'fs-active' : 'fs-inactive'}`}>
-                        <span />{item.active ? 'Active' : 'Inactive'}</span></td>
-                      <td><div className="fs-history-actions">
-                        {item.active && preferredLink && (
-                          <button className="fs-small-button" type="button" onClick={() => copy(preferredLink)}
-                            title="Copy sharing link"><Icon name="copy" size={15} /> Copy</button>
+                <tbody>{filteredHistory.map(item => (
+                  <tr key={item.share_id}>
+                    <td><div className="fs-history-file"><span className="fs-file-icon"><Icon name="file" size={17} /></span>
+                      <strong title={item.filename}>{item.filename}</strong></div></td>
+                    <td><span className="fs-count">{item.download_count} / {item.max_downloads}</span></td>
+                    <td className="fs-date">{formatDate(item.expires_at)}</td>
+                    <td><span className={`fs-status-badge ${item.active ? 'fs-active' : 'fs-inactive'}`}>
+                      <span />{item.active ? 'Active' : 'Inactive'}</span></td>
+                    <td>
+                      <div className="fs-history-actions">
+                        {item.active && item.tor_link && (
+                          <button
+                            className="fs-small-button"
+                            type="button"
+                            onClick={() => copy(item.tor_link)}
+                            title="Copy Onion sharing link"
+                            aria-label={`Copy Onion link for ${item.filename}`}
+                          >
+                            <Icon name={copiedUrl === item.tor_link ? 'check' : 'shield'} size={15} />
+                            {copiedUrl === item.tor_link ? 'Copied Onion' : 'Copy Onion'}
+                          </button>
+                        )}
+                        {item.active && item.clearnet_link && (
+                          <button
+                            className="fs-small-button"
+                            type="button"
+                            onClick={() => copy(item.clearnet_link)}
+                            title="Copy HTTPS sharing link"
+                            aria-label={`Copy HTTPS link for ${item.filename}`}
+                          >
+                            <Icon name={copiedUrl === item.clearnet_link ? 'check' : 'globe'} size={15} />
+                            {copiedUrl === item.clearnet_link ? 'Copied HTTPS' : 'Copy HTTPS'}
+                          </button>
                         )}
                         {item.active && (
-                          <button className="fs-icon-button fs-danger-button" type="button"
-                            disabled={Boolean(stoppingId)} title="Stop sharing" aria-label={`Stop sharing ${item.filename}`}
-                            onClick={() => stopShare(item.share_id)}><Icon name="stop" size={17} /></button>
+                          <button
+                            className="fs-icon-button fs-danger-button"
+                            type="button"
+                            disabled={Boolean(stoppingId)}
+                            title="Stop sharing"
+                            aria-label={`Stop sharing ${item.filename}`}
+                            onClick={() => stopShare(item.share_id)}
+                          >
+                            <Icon name="stop" size={17} />
+                          </button>
+                        )}
+                        {item.active && !item.tor_link && !item.clearnet_link && (
+                          <span className="fs-muted">Link unavailable</span>
                         )}
                         {!item.active && <span className="fs-muted">—</span>}
-                      </div></td>
-                    </tr>
-                  );
-                })}</tbody>
+                      </div>
+                    </td>
+                  </tr>
+                ))}</tbody>
               </table>
             </div>
           )}
