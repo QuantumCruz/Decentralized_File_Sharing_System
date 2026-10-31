@@ -1,6 +1,7 @@
-# FileShare 1.0.0 stable Windows build.
-# Supports release/v1.0.0 and main.
-# Does not delete installed applications or personal application data.
+# FileShare stable Windows release builder.
+# Compatible with Windows PowerShell 5.1.
+# Builds the version declared in package.json.
+# Preserves installed applications and application data.
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -23,19 +24,57 @@ function Invoke-Checked {
     }
 }
 
+function Get-PackageVersion {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $JsonFile
+    )
+
+    if (-not (Test-Path -LiteralPath $JsonFile -PathType Leaf)) {
+        throw "Missing file: $JsonFile"
+    }
+
+    $content = Get-Content -LiteralPath $JsonFile -Raw
+
+    # Both npm metadata files declare their top-level version
+    # before any nested dependency version fields.
+    # Read only that first version field.
+    $pattern = '(?m)^[ \t]*"version"[ \t]*:[ \t]*"(?<version>[0-9]+\.[0-9]+\.[0-9]+)"'
+
+    $result = [regex]::Match($content, $pattern)
+
+    if (-not $result.Success) {
+        throw "Cannot read application version from $JsonFile"
+    }
+
+    return $result.Groups['version'].Value
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 Push-Location $root
 
 try {
+    Write-Host "`nFileShare Stable Release Builder" -ForegroundColor Cyan
+
     $branch = (& git branch --show-current).Trim()
 
     if (
         $LASTEXITCODE -ne 0 -or
-        $branch -notin @('release/v1.0.0', 'main')
+        $branch -notin @('main', 'release/v1.0.0')
     ) {
-        throw "Stable builds require release/v1.0.0 or main. Current branch: $branch"
+        throw "Unexpected Git branch: $branch"
     }
+
+    # Read application versions without parsing the entire lockfile.
+    $version = Get-PackageVersion 'package.json'
+    $lockedVersion = Get-PackageVersion 'package-lock.json'
+
+    if ($version -ne $lockedVersion) {
+        throw "Version mismatch: $version versus $lockedVersion"
+    }
+
+    Write-Host "Building FileShare v$version" -ForegroundColor Green
 
     $required = @(
         'electron-builder.stable.json',
@@ -55,23 +94,48 @@ try {
 
     foreach ($file in $required) {
         if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-            throw "Missing required file: $file"
+            throw "Required file missing: $file"
         }
     }
 
+    # Verify the specific Tor compatibility fix.
+    $torVersion = (& '.\binaries\tor.exe' --version) -join ' '
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        $torVersion -notmatch '0\.4\.9\.15'
+    ) {
+        throw "Expected Tor 0.4.9.15. Found: $torVersion"
+    }
+
+    Write-Host "Tor verified: $torVersion" -ForegroundColor Green
+
+    # Ensure the existing IPFS binary remains unchanged in version.
+    $ipfsVersion = (& '.\binaries\ipfs.exe' version) -join ' '
+
+    if (
+        $LASTEXITCODE -ne 0 -or
+        $ipfsVersion -notmatch '0\.7\.0'
+    ) {
+        throw "Expected go-ipfs 0.7.0. Found: $ipfsVersion"
+    }
+
+    Write-Host "IPFS verified: $ipfsVersion" -ForegroundColor Green
+
+    # Verify stable frontend routing.
     $frontend = Get-Content 'src/index.js' -Raw
 
     if (-not $frontend.Contains("'35300'")) {
-        throw "Stable owner port 35300 is missing from React routing."
+        throw "Stable owner port 35300 is missing."
     }
 
     $branding = Get-Content 'src/preview_branding.css' -Raw
 
     if (-not $branding.Contains('url("./fileshare-icon.png")')) {
-        throw "React icon reference is incorrect."
+        throw "Invalid branding icon reference."
     }
 
-    # Install the artwork into its build locations.
+    # Prepare branding assets.
     Copy-Item 'assets/FileShare_Icon.ico' 'assets/icon.ico' -Force
     Copy-Item 'assets/FileShare_Icon.ico' 'public/favicon.ico' -Force
     Copy-Item 'assets/FileShare_Icon.png' 'src/fileshare-icon.png' -Force
@@ -79,9 +143,14 @@ try {
     Copy-Item 'assets/FileShare_Logo_192.png' 'public/logo192.png' -Force
     Copy-Item 'assets/FileShare_Logo_512.png' 'public/logo512.png' -Force
 
-    # Always run the existing security and runtime tests.
+    # Run tests before removing any generated files.
     Invoke-Checked 'python' @(
-        '-m', 'unittest', 'discover', '-s', 'tests', '-v'
+        '-m',
+        'unittest',
+        'discover',
+        '-s',
+        'tests',
+        '-v'
     )
 
     Invoke-Checked 'node' @(
@@ -89,33 +158,39 @@ try {
         'public/stable_electron.js'
     )
 
-    # Delete only generated frontend files.
+    # Remove only generated frontend builds.
     foreach ($folder in @('build', 'server/build')) {
         if (Test-Path -LiteralPath $folder) {
             Remove-Item -LiteralPath $folder -Recurse -Force
         }
     }
 
-    # Build the Python backend from current source.
+    # Build the backend.
     Invoke-Checked 'python' @(
-        '-m', 'PyInstaller',
+        '-m',
+        'PyInstaller',
         '--noconfirm',
         '--clean',
         '--onefile',
         '--windowed',
-        '--name', 'stable_server',
-        '--paths', '.',
-        '--distpath', 'dist-stable/backend',
-        '--workpath', 'dist-stable/pyinstaller-work',
-        '--specpath', 'dist-stable/spec',
+        '--name',
+        'stable_server',
+        '--paths',
+        '.',
+        '--distpath',
+        'dist-stable/backend',
+        '--workpath',
+        'dist-stable/pyinstaller-work',
+        '--specpath',
+        'dist-stable/spec',
         'server/stable_server.py'
     )
 
     if (-not (Test-Path 'dist-stable/backend/stable_server.exe' -PathType Leaf)) {
-        throw 'The Python backend executable is missing.'
+        throw "Backend executable was not generated."
     }
 
-    # Build the React frontend.
+    # Compile the frontend.
     Invoke-Checked 'npm.cmd' @(
         'run',
         'build'
@@ -129,19 +204,20 @@ try {
     )
 
     foreach ($file in $frontendFiles) {
-        if (-not (Test-Path $file -PathType Leaf)) {
-            throw "Built frontend file missing: $file"
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "Missing frontend build file: $file"
         }
     }
 
-    # Remove old generated stable installers.
-    Get-ChildItem 'dist-stable' `
-        -Filter 'FileShare-Setup-*.exe' `
-        -File `
-        -ErrorAction SilentlyContinue |
-        Remove-Item -Force
+    # Generate the installer filename from the current version.
+    $installerName = "FileShare-Setup-$version-x64.exe"
+    $installerPath = Join-Path 'dist-stable' $installerName
 
-    # Build the actual stable Windows installer.
+    if (Test-Path -LiteralPath $installerPath -PathType Leaf) {
+        Remove-Item -LiteralPath $installerPath -Force
+    }
+
+    # Package the stable Windows application.
     Invoke-Checked 'npx.cmd' @(
         'electron-builder',
         '--win',
@@ -151,40 +227,52 @@ try {
         'electron-builder.stable.json'
     )
 
-    $packaged = @(
+    $resources = 'dist-stable/win-unpacked/resources'
+
+    $packagedFiles = @(
         'dist-stable/win-unpacked/FileShare by QuantumCruz.exe',
-        'dist-stable/win-unpacked/resources/backend/stable_server.exe',
-        'dist-stable/win-unpacked/resources/binaries/ipfs.exe',
-        'dist-stable/win-unpacked/resources/binaries/tor.exe',
-        'dist-stable/win-unpacked/resources/binaries/cloudflared.exe',
-        'dist-stable/win-unpacked/resources/server/build/index.html',
-        'dist-stable/win-unpacked/resources/assets/icon.ico'
+        "$resources/backend/stable_server.exe",
+        "$resources/binaries/ipfs.exe",
+        "$resources/binaries/tor.exe",
+        "$resources/binaries/cloudflared.exe",
+        "$resources/server/build/index.html",
+        "$resources/assets/icon.ico"
     )
 
-    foreach ($file in $packaged) {
-        if (-not (Test-Path $file -PathType Leaf)) {
-            throw "Incomplete packaged application: $file"
+    foreach ($file in $packagedFiles) {
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
+            throw "Packaged component missing: $file"
         }
     }
 
-    $installers = @(
-        Get-ChildItem 'dist-stable' `
-            -Filter 'FileShare-Setup-1.0.0-x64.exe' `
-            -File
-    )
+    # Verify the exact Tor and IPFS executables are packaged.
+    foreach ($binary in @('tor.exe', 'ipfs.exe')) {
+        $source = Join-Path 'binaries' $binary
+        $destination = Join-Path "$resources/binaries" $binary
 
-    if ($installers.Count -ne 1) {
-        throw 'Expected exactly one stable Windows installer.'
+        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+        $destinationHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+
+        if ($sourceHash -ne $destinationHash) {
+            throw "Packaged $binary does not match the source executable."
+        }
     }
 
-    Write-Host "`nFILESHARE STABLE BUILD SUCCESSFUL" -ForegroundColor Green
-    Write-Host "Installer: $($installers[0].FullName)"
-    Write-Host "Size: $([math]::Round($installers[0].Length / 1MB, 2)) MB"
+    if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+        throw "Installer missing: $installerName"
+    }
 
-    Get-FileHash $installers[0].FullName -Algorithm SHA256 |
+    $installer = Get-Item -LiteralPath $installerPath
+
+    Write-Host "`nFILESHARE v$version BUILD SUCCESSFUL" -ForegroundColor Green
+    Write-Host "Installer: $($installer.FullName)"
+    Write-Host "Size: $([math]::Round($installer.Length / 1MB, 2)) MiB"
+
+    Get-FileHash $installer.FullName -Algorithm SHA256 |
         Format-List Algorithm, Hash, Path
 
-    Write-Host 'Build complete. Existing application data remains untouched.'
+    Write-Host "Packaged Tor and IPFS checksums verified."
+    Write-Host "Application data was not modified by this build."
 }
 finally {
     Pop-Location
