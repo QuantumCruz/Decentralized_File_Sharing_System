@@ -85,11 +85,18 @@ class DevProfileTests(unittest.TestCase):
             self.root / ".fileshare-dev"
         )
 
-        for entry in profile["paths"].values():
+        for name, entry in profile["paths"].items():
+            actual = Path(entry).resolve()
+            expected = workspace.resolve()
+
             self.assertTrue(
-                Path(entry).resolve().is_relative_to(
-                    workspace.resolve()
-                )
+                actual.is_relative_to(expected),
+                msg=(
+                    f"Path '{name}' is outside the workspace.\n"
+                    f"Actual: {actual}\n"
+                    f"Workspace: {expected}\n"
+                    f"Original entry: {entry}"
+                ),
             )
 
         self.assertFalse(
