@@ -87,8 +87,8 @@ class DevProfileTests(unittest.TestCase):
 
         for entry in profile["paths"].values():
             self.assertTrue(
-                Path(entry).is_relative_to(
-                    workspace
+                Path(entry).resolve().is_relative_to(
+                    workspace.resolve()
                 )
             )
 
